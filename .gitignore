@@ -1,0 +1,59 @@
+# macOS
+.DS_Store
+
+# IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# VS Code
+.vscode/
+
+# Java / Maven
+target/
+**/target/
+*.class
+*.jar
+*.war
+
+# Logs
+*.log
+logs/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python - for upcoming agent service
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node - for upcoming frontend
+node_modules/
+dist/
+build/
+
+# Test / coverage artifacts
+coverage/
+htmlcov/
+.coverage
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# Local database/data volumes
+postgres-data/
+kafka-data/
+data/
+
+# Claude/local AI tooling
+.claude/

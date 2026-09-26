@@ -1,0 +1,60 @@
+spring:
+  application:
+    name: reconai-financial-core
+
+  datasource:
+    url: ${RECONAI_DB_URL:jdbc:postgresql://localhost:5432/reconai}
+    username: ${RECONAI_DB_USERNAME:reconai}
+    password: ${RECONAI_DB_PASSWORD:reconai}
+
+  jpa:
+    hibernate:
+      # Flyway owns the schema. Hibernate validates the mapping against it and must
+      # never create or mutate it. Do not change this value.
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+
+  jackson:
+    serialization:
+      # ISO-8601 UTC timestamps, e.g. 2026-09-26T14:32:00Z
+      write-dates-as-timestamps: false
+      # Monetary values are serialised as plain decimals, never scientific notation.
+      write-bigdecimal-as-plain: true
+
+  kafka:
+    bootstrap-servers: ${RECONAI_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      properties:
+        # Bounds producer-side synchronous blocking, which happens on the calling thread
+        # while metadata is fetched. Send completion is handled asynchronously.
+        max.block.ms: 5000
+      # Serializers are set in KafkaProducerConfig rather than here, so that the event
+      # uses the application's ObjectMapper and renders timestamps exactly as the REST
+      # API does. Type headers are disabled there for the same reason.
+
+# Topics the financial core publishes to. The core produces only; it never consumes.
+reconai:
+  kafka:
+    reconciliation-exceptions-topic: ${RECONAI_KAFKA_EXCEPTIONS_TOPIC:reconciliation.exceptions}
+
+server:
+  port: ${RECONAI_PORT:8080}
+  error:
+    # API errors are produced by the application's own handler. The container must
+    # not leak stack traces, messages or binding details into responses.
+    include-stacktrace: never
+    include-message: never
+    include-binding-errors: never
+
+logging:
+  level:
+    org.flywaydb: INFO

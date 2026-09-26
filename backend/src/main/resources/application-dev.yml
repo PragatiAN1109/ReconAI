@@ -1,0 +1,16 @@
+# Local development profile: activate with --spring.profiles.active=dev
+#
+# The only behavioural difference from the default profile is that Flyway also scans
+# classpath:db/seed, which holds the deterministic development dataset. Seed data is
+# therefore versioned and reproducible, and it can never reach an environment that
+# does not explicitly enable this profile.
+#
+# The seed migration itself is added in a later stage; the location is configured
+# here so that schema migrations and demo data stay cleanly separated.
+spring:
+  flyway:
+    locations: classpath:db/migration,classpath:db/seed
+
+logging:
+  level:
+    com.reconai: DEBUG

@@ -1,0 +1,27 @@
+# Integration test profile.
+#
+# The datasource is supplied by the Testcontainers PostgreSQL instance via
+# @ServiceConnection, so no connection properties are declared here.
+#
+# Flyway scans only db/migration: tests exercise the real schema and create their own
+# fixtures, so development seed data must not be present.
+spring:
+  main:
+    # Lets a test replace the auto-configured KafkaTemplate with a mock. Test scope only;
+    # the application profiles keep Spring's default of rejecting overrides.
+    allow-bean-definition-overriding: true
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  kafka:
+    # No broker runs for the financial-core tests. Those tests are all @Transactional and
+    # roll back, so the AFTER_COMMIT listener never fires and nothing is ever sent. This
+    # short block keeps any accidental send failing fast instead of stalling a test.
+    bootstrap-servers: localhost:9092
+    producer:
+      properties:
+        max.block.ms: 1000

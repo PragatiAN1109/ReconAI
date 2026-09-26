@@ -1,0 +1,2 @@
+# Placeholder so that classpath:db/seed resolves for the dev profile before the
+# seed migration exists. Replaced by V900__seed_dev_dataset.sql in a later stage.
