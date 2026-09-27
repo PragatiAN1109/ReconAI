@@ -776,81 +776,62 @@ otherwise.
 
 ---
 
-# 12. PolicyDocument
+# 12. PolicyDocument — not a database table
 
 ## Purpose
 
-Represents a financial or operational document available to the RAG system.
+Represents a financial or operational document the investigation can cite.
 
-## Table
+**Not implemented as a table.** The V1 policy corpus is five synthetic Markdown
+files on disk in `policies/`, parsed at service startup. There is no
+`policy_documents` table, no ingestion pipeline and no `document_type`,
+`version`, `content_hash` or `active` column — those exist nowhere in the
+schema.
+
+What the implementation actually uses from a document is its `document_id` and
+`title`, read from YAML front matter, plus its section headings. That is enough
+to cite it:
 
 ```text
-policy_documents
+[POL-FEE-001] Merchant Fee Schedule — §Cross-Network Settlement Fees
 ```
 
-## Fields
-
-| Field | Type | Required | Description |
-|---|---|---:|---|
-| id | UUID | Yes | Internal primary key |
-| document_id | VARCHAR(50) | Yes | Unique business ID |
-| title | VARCHAR(255) | Yes | Document title |
-| document_type | VARCHAR(50) | Yes | Policy classification |
-| version | VARCHAR(30) | Yes | Document version |
-| effective_from | TIMESTAMPTZ | Yes | Effective date |
-| effective_to | TIMESTAMPTZ | No | Expiration |
-| content_hash | VARCHAR(64) | Yes | SHA-256 content hash |
-| active | BOOLEAN | Yes | Active status |
-| created_at | TIMESTAMPTZ | Yes | Creation time |
+Document versioning is the notable gap. A policy citation stored today records
+the **excerpt text** alongside the identifier (see section 10), so a reviewer
+reads the words the investigation saw even if the file later changes — but there
+is no version number to cite. If policies become editable rather than fixed
+fixtures, versioning is what would need designing, and a table would then earn
+its place.
 
 ## PolicyDocumentType
 
-```text
-MERCHANT_FEE_POLICY
-SETTLEMENT_POLICY
-RECONCILIATION_POLICY
-CURRENCY_POLICY
-EXCEPTION_HANDLING_POLICY
-```
+Not implemented; documents are not classified by type. The five corpus documents
+are listed in `docs/architecture.md` section 8.
 
 ---
 
-# 13. PolicyChunk
+# 13. PolicyChunk — not a database table
 
 ## Purpose
 
-Stores retrievable sections of policy documents for semantic search.
+Retrievable sections of policy documents.
 
-## Table
+**Not implemented as a table, and there is no `embedding` column anywhere in
+this system.** The earlier draft's `embedding VECTOR` field assumed semantic
+retrieval; V1 uses deterministic lexical search over the Markdown corpus, with
+no embeddings, no vector store and no pgvector. See `docs/architecture.md`
+section 8 for why that is a considered choice rather than a stopgap.
 
-```text
-policy_chunks
-```
+The retrieval unit is a `(document, section)` pair held in memory, not a
+persisted chunk. The requirement the original section captured still holds and
+is met:
 
-## Fields
-
-| Field | Type | Required | Description |
-|---|---|---:|---|
-| id | UUID | Yes | Internal primary key |
-| chunk_id | VARCHAR(50) | Yes | Unique business ID |
-| document_id | UUID | Yes | Parent policy document |
-| section | VARCHAR(255) | No | Human-readable section |
-| chunk_index | INTEGER | Yes | Position within document |
-| content | TEXT | Yes | Chunk content |
-| embedding | VECTOR | Yes | Semantic embedding |
-| created_at | TIMESTAMPTZ | Yes | Creation time |
-
-## Relationship
+A retrieved excerpt retains its document and section so evidence can be
+displayed as:
 
 ```text
-PolicyDocument 1 ---- * PolicyChunk
-```
-
-A retrieved chunk must retain its document and section information so the UI can display meaningful evidence such as:
-
-```text
-Settlement Processing Policy
-Section 4.2
+Merchant Fee Schedule
+§Cross-Network Settlement Fees
 ```
 
 rather than merely:
@@ -858,6 +839,10 @@ rather than merely:
 ```text
 Chunk 18
 ```
+
+This is enforced by the grounding validator: a policy citation naming a section
+must match a section that was really returned, because citing the right document
+and the wrong section is still a claim about text nobody read.
 
 ---
 
@@ -1183,7 +1168,7 @@ separate, deliberate step outside this service.
 
 # 19. Status Transitions
 
-## ReconciliationException
+## ReconciliationException — target lifecycle, not yet implemented
 
 ```text
 OPEN
@@ -1201,9 +1186,21 @@ RESOLVED  OPEN      ESCALATED
           (rejected)
 ```
 
-A rejected recommendation does not automatically mean the underlying exception disappears.
+**In V1 an exception is created `OPEN` and stays `OPEN`.** The other four
+statuses are declared in `ExceptionStatus` and constrained in the database, but
+nothing transitions into them: the Financial Core's exception API is read-only,
+and the Investigation Service never writes to the Financial Core at all.
 
-It may return to manual investigation.
+This is a consequence of the ownership boundary, not an oversight. Approving a
+recommendation records a human judgement about an *explanation*; it does not
+resolve the financial exception. Closing that loop means designing a deliberate,
+authenticated write path into the Financial Core — which V1 does not have and
+does not pretend to have.
+
+The investigation's own lifecycle below is the one that actually moves.
+
+A rejected recommendation does not automatically mean the underlying exception
+disappears. It may return to manual investigation.
 
 ---
 
@@ -1418,8 +1415,8 @@ effect.
 The composite `(investigation_id, sequence_no)` serves the only way the trail is
 read — one investigation's timeline, in order.
 
-No index on `policy_chunks`: the policy corpus is Markdown on disk in V1, with
-no embeddings and no vector database. For a corpus this size, lexical search is
+No policy tables at all, so no indexes on them: the policy corpus is Markdown on
+disk in V1, with no embeddings and no vector database. For a corpus this size, lexical search is
 correct, explainable and fast enough, and an unexplainable retrieval step would
 undercut the evidence guarantees the rest of the system rests on.
 

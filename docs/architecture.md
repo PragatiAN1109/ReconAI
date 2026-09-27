@@ -16,6 +16,39 @@ When an exception is detected, an asynchronous event triggers an AI-assisted inv
 
 The recommendation is advisory and requires human review before the exception can be considered resolved.
 
+### The implemented pipeline
+
+```text
+Financial Core (Spring)
+    ↓  deterministic reconciliation — rule precedence, BigDecimal
+ReconciliationException
+    ↓  Kafka, published after the database transaction commits
+Investigation (PENDING)
+    ↓  claimed PENDING → RUNNING
+AI investigator (bounded tool loop)
+    ↓  four read-only tools, nothing else callable
+Evidence Ledger — what the tools actually returned
+    ↓
+structured InvestigationResult
+    ↓  grounding validation: every citation checked, or the result is rejected
+durable recommendation + grounded evidence
+    ↓  deterministic guardrail (application code, never the model)
+AWAITING_REVIEW  /  ESCALATED
+    ↓  human decision
+COMPLETED  /  ESCALATED
+    ↓
+append-only audit trail
+```
+
+Each step narrows what the next may assert. The deterministic engine establishes
+*that* two records disagree; the investigator may cite only evidence it actually
+retrieved; the guardrail — not the model — decides what a human sees; and only a
+human reaches `COMPLETED`.
+
+Everything from `Investigation (PENDING)` down is owned by the Python
+Investigation Service. It reads from the Financial Core and **never writes to
+it**.
+
 ---
 
 ## 2. High-Level Architecture
@@ -55,21 +88,31 @@ The recommendation is advisory and requires human review before the exception ca
                        ┌──────────────────────────────────┼───────────────────┐
                        │                  │               │                   │
                        ▼                  ▼               ▼                   ▼
-               Transaction Tool    Settlement Tool   Fee Rule Tool      History Tool
+              get_transaction    get_settlements   get_fee_rules   search_policy_documents
                        │                  │               │                   │
+                       │   (read-only HTTP to Financial Core)    (local Markdown corpus,
+                       │                  │               │       deterministic lexical search)
                        └──────────────────┴───────┬───────┴───────────────────┘
                                                   │
                                                   ▼
-                                           Policy Search
-                                               (RAG)
+                                          Evidence Ledger
+                                    (what the tools actually returned)
                                                   │
                                                   ▼
-                                          PostgreSQL/pgvector
+                                      Grounding validation
+                                 (every citation checked, or rejected)
                                                   │
                                                   ▼
-                                       Evidence-backed Result
+                                  Durable result + grounded evidence
                                                   │
                                                   ▼
+                                      Deterministic guardrail
+                                                  │
+                                    ┌─────────────┴─────────────┐
+                                    ▼                           ▼
+                             AWAITING_REVIEW                ESCALATED
+                                    │
+                                    ▼
                                             Human Review
                                            Approve / Reject
                                                   │
@@ -81,9 +124,13 @@ The recommendation is advisory and requires human review before the exception ca
 
 ## 3. Major Components
 
-### 3.1 Operations Console
+### 3.1 Operations Console — not yet built
 
 **Technology:** React + TypeScript + Vite
+
+**This component does not exist yet.** The backend endpoints it will call are
+implemented and tested; nothing renders them. The responsibilities below are its
+intended scope.
 
 The Operations Console provides the user interface for reconciliation analysts.
 
@@ -114,13 +161,17 @@ Primary responsibilities:
 
 - manage transactions;
 - manage settlements;
+- manage fee rules;
 - execute deterministic reconciliation;
 - create reconciliation exceptions;
-- expose REST APIs;
-- publish reconciliation-exception events;
-- manage investigation state;
-- process human approval decisions; and
-- persist audit events.
+- expose read APIs used as controlled evidence sources; and
+- publish reconciliation-exception events after commit.
+
+**Not** the Financial Core's responsibilities: investigation state, AI
+execution, recommendations, human review decisions and the investigation audit
+trail all belong to the Python Investigation Service, which owns the
+`investigation` schema. An earlier draft of this list assigned them here; see
+`docs/data-model.md` section 23 for why they moved.
 
 The Financial Core must not depend on the AI service to determine whether financial records reconcile.
 
@@ -197,19 +248,19 @@ When the reconciliation engine detects an exception, the Financial Core publishe
 reconciliation.exceptions
 ```
 
-Example event:
+Event (the whole contract — see section 5.5):
 
 ```json
 {
-  "eventId": "EVT-1001",
   "exceptionId": "EX-1042",
   "transactionId": "TX-48291",
-  "exceptionType": "AMOUNT_MISMATCH",
+  "type": "AMOUNT_MISMATCH",
   "detectedAt": "2026-09-26T14:32:00Z"
 }
 ```
 
-The investigation service consumes this event and begins an investigation.
+The investigation service consumes this event and records a `PENDING`
+investigation.
 
 ### Why Asynchronous Processing?
 
@@ -265,12 +316,14 @@ Pydantic validation
 Investigation persisted (PENDING)
         |
         v
-(agent investigation: not yet implemented)
+run: claimed PENDING -> RUNNING, then investigated
 ```
 
 **Why Kafka exists.** AI investigation has variable latency and independent failure modes. Placing a queue between detection and investigation means a slow, failing or entirely absent investigation service cannot affect whether the financial core establishes that two authoritative records disagree.
 
-The Python service consumes the topic under the fixed group `reconai-investigation-service`, with `auto.offset.reset=latest` and manual commits after each record. Delivery is at-least-once, so investigation handling must be idempotent by `exceptionId` once it exists. A validated event becomes a `PENDING` investigation, at most one per `exceptionId` — enforced by a unique constraint rather than an application check, since duplicate deliveries can arrive concurrently. A record's offset is committed only once it has been recorded or judged permanently unusable; a valid event that cannot be stored leaves its offset uncommitted so it is redelivered rather than lost. Nothing beyond that happens: no evidence is fetched and no model is called.
+The Python service consumes the topic under the fixed group `reconai-investigation-service`, with `auto.offset.reset=latest` and manual commits after each record. Delivery is at-least-once, so investigation handling must be idempotent by `exceptionId` once it exists. A validated event becomes a `PENDING` investigation, at most one per `exceptionId` — enforced by a unique constraint rather than an application check, since duplicate deliveries can arrive concurrently. A record's offset is committed only once it has been recorded or judged permanently unusable; a valid event that cannot be stored leaves its offset uncommitted so it is redelivered rather than lost.
+
+Consumption stops there. Ingestion creates a `PENDING` investigation and nothing more: no evidence is fetched and no model is called on the consumer path. Investigating is a separate, explicitly triggered step, so a broker backlog cannot turn into a burst of model calls.
 
 The investigation service owns the `investigation` schema and writes nowhere else. It never reads or writes `transactions`, `settlements` or `reconciliation_exceptions`, and holds no foreign keys into them; `exceptionId` and `transactionId` are resolved through the financial core's API instead.
 
@@ -360,7 +413,7 @@ Identity and classification only. No internal UUID, no settlement, no amounts, n
 
 No `__TypeId__` header is attached: Java class names are meaningless to a Python consumer and leak internal structure. Timestamps are serialised by the application's own `ObjectMapper`, so the message and the REST API render an instant identically.
 
-Note that this payload is narrower than the illustrative examples earlier in this section and in `api-contract.md` section 10, which also show `eventId`, `eventType`, `eventVersion` and `correlationId`. Those are envelope concerns worth adding when a consumer exists to need them; V1 carries the minimum a consumer must have to start an investigation.
+These four fields are the entire contract, asserted in Spring's own `KafkaDeliveryIntegrationTest` and mirrored by the Python consumer, which rejects unknown fields. Earlier drafts of this document and of `api-contract.md` also showed `eventId`, `eventType`, `eventVersion` and `correlationId`; none of those exist. They are envelope concerns worth adding when a consumer needs them, and adding one is a coordinated change across the Spring record, the Python model, the tests and the docs — not a gap to be quietly filled.
 
 ---
 
@@ -444,15 +497,23 @@ This tool may provide evidence explaining an amount discrepancy.
 
 ---
 
-### 7.4 get_transaction_history
+### 7.4 get_transaction_history — not implemented
 
 ```text
 get_transaction_history(merchant_id)
 ```
 
-Retrieves relevant historical transaction and settlement information.
+**This tool does not exist.** It is not in the allowlist, there is no Financial
+Core endpoint behind it, and the agent cannot call it.
 
-This allows the investigation agent to identify patterns such as recurring settlement adjustments.
+It is retained here as a candidate capability because pattern evidence — "this
+merchant is adjusted like this every month" — would be genuinely useful. It is
+absent for a reason worth stating: `HISTORICAL_TRANSACTION` is correspondingly
+absent from the evidence source enum, because a citation type with no tool
+behind it could only ever be produced from imagination.
+
+Implementing it means adding the endpoint, the tool, the evidence type and the
+ledger support together.
 
 ---
 
@@ -477,49 +538,61 @@ The investigation agent should use these references when supporting policy-relat
 
 ---
 
-## 8. Retrieval-Augmented Generation
+## 8. Policy Knowledge Retrieval
 
-Financial policies represent external domain knowledge that may change independently of application code or model training.
-
-ReconAI therefore uses Retrieval-Augmented Generation rather than expecting the language model to know financial policies.
+Financial policies represent external domain knowledge that may change
+independently of application code or model training. ReconAI therefore retrieves
+policy text and supplies it as evidence, rather than expecting the language model
+to know financial policies.
 
 ### V1 Knowledge Base
 
-The initial synthetic knowledge base includes:
+Five synthetic Markdown documents in `policies/`:
 
 ```text
-Merchant Fee Schedule
-Settlement Processing Policy
-Reconciliation Operations Manual
-Currency Conversion Policy
-Exception Handling Policy
+Merchant Fee Schedule            POL-FEE-001
+Settlement Processing Policy     POL-SETTLEMENT-001
+Reconciliation Operations Manual POL-RECON-001
+Currency Conversion Policy       POL-FX-001
+Exception Handling Policy        POL-EXCEPTION-001
 ```
 
-Documents are:
+They are synthetic, describing no real processor, bank, network or regulator.
+See `policies/README.md`.
+
+### Deterministic lexical search — no embeddings, no vector store
 
 ```text
-Document
+Markdown documents on disk
    ↓
-Chunking
+parsed into (document, section) units at startup
    ↓
-Embedding
+lexical term matching with a fixed scoring rule
    ↓
-Vector Storage
-   ↓
-Semantic Retrieval
+ranked excerpts, each carrying document ID and section
 ```
 
-### Vector Storage
+**There is no embedding step, no vector database and no pgvector.** Retrieval is
+term matching: how many of the query's distinct terms a section contains,
+weighted by frequency damped for length, with extra weight for terms in the
+heading. Ties break by document ID then position.
 
-V1 uses:
+This is a deliberate choice, not a placeholder. For a corpus this size, lexical
+search is correct, fast, and — most importantly — **explainable**: the same
+query always returns the same sections in the same order, and why a section
+matched can be read off the query. An unexplainable retrieval step underneath
+evidence that the rest of the system treats as verifiable would undercut the
+grounding guarantees everything else rests on.
 
-```text
-PostgreSQL + pgvector
-```
+Swapping in semantic retrieval later is a change behind the `search_policy_documents`
+tool contract; callers would not change. It is not implemented today.
 
-This avoids introducing a separate vector database while the dataset remains relatively small.
+### Filesystem boundary
 
-The architecture allows a dedicated vector database to be introduced later if scale or retrieval requirements justify it.
+`PolicySearch` exposes one public method, `search(query)`. There is no
+`read_file`, no directory listing, and no path or filename argument. The corpus
+directory is fixed at construction and only `*.md` files within it are read, so
+a query is search terms and never a path.
 
 ---
 
@@ -552,7 +625,7 @@ get_fee_rules()
 Potential matching fee found
         |
         v
-search_policies()
+search_policy_documents()
         |
         v
 Applicable policy retrieved
@@ -1256,9 +1329,12 @@ Kafka provides asynchronous decoupling between these workloads.
 
 The domain is strongly relational and benefits from transactional consistency.
 
-### pgvector for V1 Retrieval
+### Deterministic Lexical Policy Retrieval for V1
 
-The initial policy corpus is small enough that introducing separate vector infrastructure would add unnecessary operational complexity.
+The policy corpus is small enough that neither a vector database nor pgvector is
+warranted. Lexical search is also reproducible and explainable, which matters
+more here than recall: policy text is cited as evidence, and evidence retrieved
+by a process nobody can account for is weak evidence.
 
 ### Human Authorization Boundary
 
@@ -1323,7 +1399,7 @@ Python Investigation Agent
         |
         +---- get_fee_rules()
         |
-        +---- search_policies()
+        +---- search_policy_documents()
         |
         v
 Grounding validation

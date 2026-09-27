@@ -486,7 +486,8 @@ GET /api/v1/exceptions/{exceptionId}
 
 # 10. Kafka Event Contract
 
-When an exception is created, the Financial Core publishes an event.
+When an exception is created, the Financial Core publishes an event **after the
+database transaction commits**.
 
 ## Topic
 
@@ -494,243 +495,156 @@ When an exception is created, the Financial Core publishes an event.
 reconciliation.exceptions
 ```
 
+Message key: `transactionId`, so every event about one transaction lands on the
+same partition and stays ordered.
+
 ## Event
 
+Exactly four fields. Verified against
+`com.reconai.exception.ReconciliationExceptionEvent` and asserted in
+`KafkaDeliveryIntegrationTest`, which requires the serialized payload to contain
+precisely this field set:
+
 ```json
 {
-  "eventId": "EVT-1001",
-  "eventType": "RECONCILIATION_EXCEPTION_DETECTED",
-  "eventVersion": "1",
   "exceptionId": "EX-1042",
   "transactionId": "TX-48291",
-  "exceptionType": "AMOUNT_MISMATCH",
-  "detectedAt": "2026-09-26T14:32:00Z",
-  "correlationId": "CORR-89123"
+  "type": "AMOUNT_MISMATCH",
+  "detectedAt": "2026-09-26T14:32:00Z"
 }
 ```
 
-### Important
+`type` is one of `AMOUNT_MISMATCH`, `MISSING_SETTLEMENT`, `DUPLICATE_SETTLEMENT`,
+`CURRENCY_MISMATCH`. `detectedAt` is ISO-8601 with a timezone; a naive timestamp
+is rejected by the consumer rather than assumed to be UTC.
 
-Kafka events should contain identifiers and necessary routing context.
+Plain JSON — no Java type headers.
 
-They should not contain unnecessary customer or financial information.
+### Fields an earlier draft listed that do not exist
 
-The investigation service should retrieve authoritative details through tools.
+`eventId`, `eventType`, `eventVersion`, `exceptionType` and `correlationId` are
+**not** part of this event. The field is `type`, not `exceptionType`.
+
+`correlationId` is a real concept elsewhere — it is a field of the Financial
+Core's HTTP error envelope (section 5) and appears in log lines — but it is not
+carried on the message bus.
+
+These are not omissions to be filled in. Both sides of this contract are owned in
+this repository, and the consumer rejects unknown fields (`extra="forbid"`), so
+adding one is a deliberate coordinated change across the Spring record, the
+Python model, the tests and this document — not something to do because a
+document once mentioned it.
+
+### Why the payload is this small
+
+It carries identity and classification only: no internal UUID, no settlement, no
+amounts, no merchant, and nothing from the investigation layer. A consumer
+needing authoritative detail fetches it through the read APIs in section 11, so
+the event never becomes a second, drifting copy of financial data.
 
 ---
 
-# 11. Agent Financial Tool APIs
+# 11. Financial Core Read APIs used as evidence tools
 
-These endpoints exist specifically for the Investigation Agent.
+The Investigation Service retrieves authoritative records over HTTP. There is no
+separate `/api/v1/agent-tools` prefix — an earlier draft proposed one, but the
+agent consumes the Financial Core's ordinary read endpoints, and a parallel set
+of near-duplicate paths would be two contracts to keep in step for no benefit.
 
-They must be read-only.
+**Verified from `agent-service/app/financial_core_client.py`:**
 
-Suggested base path:
+| Tool | Financial Core endpoint |
+|---|---|
+| `get_transaction(transaction_id)` | `GET /api/v1/transactions/{transactionId}` |
+| `get_settlements(transaction_id)` | `GET /api/v1/transactions/{transactionId}/settlements` |
+| `get_fee_rules(...)` | `GET /api/v1/fee-rules` |
+| `search_policy_documents(query)` | *none — local to the Investigation Service* |
+
+That is the entire allowlist: four tools, all reads.
+
+## Read-only by construction
+
+`FinancialCoreClient` exposes exactly `get_transaction`, `get_settlements`,
+`get_fee_rules`, `open` and `close`. There is no `request(method, path)`, no
+`fetch_url`, and no write method of any kind — not disabled, absent. These
+methods *are* the capability list the agent receives, so a generic method would
+hand it the whole API including the endpoints that create and reconcile
+financial records. Tests assert the public surface and that only `GET` requests
+are issued.
+
+The Investigation Service also has no database access to financial records.
+
+---
+
+# 12. get_transaction
+
+```http
+GET /api/v1/transactions/{transactionId}
+```
+
+Returns the authoritative transaction, including `expectedSettlementAmount`.
+Monetary values are decimal and are parsed as `Decimal`, never `float`.
+
+A transaction that does not exist raises rather than returning null: an absence
+that was never verified is not a finding.
+
+---
+
+# 13. get_settlements
+
+```http
+GET /api/v1/transactions/{transactionId}/settlements
+```
+
+**Plural, and returns a list** — possibly empty. A transaction may have none,
+one, or several, and which it is distinguishes `MISSING_SETTLEMENT` from
+`DUPLICATE_SETTLEMENT` from everything else. An unknown transaction never
+degrades into an empty list.
+
+---
+
+# 14. get_fee_rules
+
+```http
+GET /api/v1/fee-rules?merchantId=&processor=&currency=&active=
+```
+
+All filters optional; omitted ones are not sent. A merchant filter also returns
+rules naming no merchant, since those apply to every merchant on the processor.
+No matching rules is an empty list, not an error.
+
+This endpoint sits on the normal `/api/v1` path rather than under an
+`agent-tools` prefix, consistent with the rest of the Financial Core.
+
+**A fee rule is context, not a conclusion.** A rule whose amount equals a
+settlement difference is evidence that such a fee exists — not a finding that
+this transaction was charged it.
+
+---
+
+# 15. get_transaction_history — not implemented
 
 ```text
-/api/v1/agent-tools
+get_transaction_history(merchant_id)
 ```
 
-These endpoints should never expose arbitrary SQL capability.
+**This tool and its endpoint do not exist.** It is not in the allowlist and the
+agent cannot call it. `HISTORICAL_TRANSACTION` is correspondingly absent from the
+evidence source enum: a citation type with no tool behind it could only be
+produced from imagination.
+
+Listed here so the gap is explicit rather than an apparent oversight. Adding it
+means adding the endpoint, the tool, the evidence source and ledger support
+together.
 
 ---
 
-# 12. get_transaction Tool
+# 16. search_policy_documents
 
-## Endpoint
-
-```http
-GET /api/v1/agent-tools/transactions/{transactionId}
-```
-
-### Response
-
-```json
-{
-  "transactionId": "TX-48291",
-  "merchantId": "MERCHANT-104",
-  "amount": 1247.50,
-  "expectedSettlementAmount": 1247.50,
-  "currency": "USD",
-  "transactionType": "PURCHASE",
-  "status": "POSTED",
-  "transactionTimestamp": "2026-09-26T13:45:00Z"
-}
-```
-
-This endpoint returns only fields necessary for investigation.
-
----
-
-# 13. get_settlement Tool
-
-## Endpoint
-
-```http
-GET /api/v1/agent-tools/transactions/{transactionId}/settlements
-```
-
-### Response
-
-```json
-{
-  "transactionId": "TX-48291",
-  "settlements": [
-    {
-      "settlementId": "SET-8821",
-      "processor": "NORTHSTAR_PAYMENTS",
-      "settledAmount": 1217.50,
-      "currency": "USD",
-      "status": "COMPLETED",
-      "settlementTimestamp": "2026-09-26T14:00:00Z"
-    }
-  ]
-}
-```
-
----
-
-# 14. get_fee_rules Tool
-
-## Implemented Endpoint
-
-```http
-GET /api/v1/fee-rules
-```
-
-Optional filters:
-
-```text
-merchantId
-processor
-currency
-active
-```
-
-Example:
-
-```http
-GET /api/v1/fee-rules?merchantId=MERCHANT-104&processor=NORTHSTAR_PAYMENTS&active=true
-```
-
-### Response
-
-```json
-{
-  "items": [
-    {
-      "ruleId": "FR-14",
-      "merchantId": "MERCHANT-104",
-      "processor": "NORTHSTAR_PAYMENTS",
-      "feeType": "PROCESSING",
-      "feeAmount": 50.00,
-      "currency": "USD",
-      "description": "Cross-network settlement processing fee applied per settled purchase.",
-      "active": true
-    }
-  ],
-  "total": 1
-}
-```
-
-Read-only: there is no create, update or delete path. A `merchantId` filter also returns
-rules with no merchant, since those apply to every merchant on the processor.
-
-The envelope is `{items, total}`, matching the other list endpoints in the implemented
-API rather than the merchant-keyed shape sketched below. The endpoint also sits on the
-normal `/api/v1` path rather than an `agent-tools` prefix, consistent with the
-transaction and settlement reads the investigation service already uses.
-
-## Originally Sketched Endpoint
-
-The following was the original sketch, retained for reference. It has not been
-implemented.
-
-```http
-GET /api/v1/agent-tools/merchants/{merchantId}/fee-rules
-```
-
-Example:
-
-```http
-GET /api/v1/agent-tools/merchants/MERCHANT-104/fee-rules
-```
-
-### Response
-
-```json
-{
-  "merchantId": "MERCHANT-104",
-  "rules": [
-    {
-      "ruleId": "FR-14",
-      "processor": "NORTHSTAR_PAYMENTS",
-      "feeType": "PROCESSING",
-      "feeAmount": 30.00,
-      "currency": "USD",
-      "description": "Tier B cross-network settlement processing fee.",
-      "effectiveFrom": "2026-01-01T00:00:00Z",
-      "effectiveTo": null,
-      "active": true
-    }
-  ]
-}
-```
-
----
-
-# 15. get_transaction_history Tool
-
-## Endpoint
-
-```http
-GET /api/v1/agent-tools/merchants/{merchantId}/transaction-history
-```
-
-Optional query parameters:
-
-```text
-limit
-processor
-```
-
-Example:
-
-```http
-GET /api/v1/agent-tools/merchants/MERCHANT-104/transaction-history?limit=10
-```
-
-### Response
-
-```json
-{
-  "merchantId": "MERCHANT-104",
-  "transactions": [
-    {
-      "transactionId": "TX-38182",
-      "expectedSettlementAmount": 830.00,
-      "settledAmount": 800.00,
-      "differenceAmount": 30.00,
-      "currency": "USD",
-      "processor": "NORTHSTAR_PAYMENTS"
-    },
-    {
-      "transactionId": "TX-19281",
-      "expectedSettlementAmount": 930.00,
-      "settledAmount": 900.00,
-      "differenceAmount": 30.00,
-      "currency": "USD",
-      "processor": "NORTHSTAR_PAYMENTS"
-    }
-  ]
-}
-```
-
----
-
-# 16. Policy Search Tool
-
-Policy retrieval belongs to the Investigation Agent Service.
+**Local to the Investigation Service. Not a Financial Core endpoint, and not an
+HTTP endpoint at all** — it is an in-process call against a Markdown corpus on
+disk. An earlier draft sketched `POST /internal/v1/policies/search`; no such
+route exists.
 
 Logical tool:
 
@@ -738,41 +652,30 @@ Logical tool:
 search_policy_documents(query)
 ```
 
-Internal endpoint:
+The tool takes a query and nothing else: no path, no filename, no directory
+listing, no `topK`. Results carry the document identifier and section, which is
+what makes a policy citation checkable.
 
-```http
-POST /internal/v1/policies/search
-```
-
-### Request
-
-```json
-{
-  "query": "processor settlement fees for Tier B merchants",
-  "topK": 5
-}
-```
-
-### Response
+### Result shape (as returned to the model)
 
 ```json
 {
   "results": [
     {
-      "documentId": "POL-1001",
-      "title": "Settlement Processing Policy",
-      "version": "1.2",
-      "section": "4.2 Processor Fees",
-      "content": "Tier B cross-network settlements may incur...",
-      "retrievalScore": 0.91
+      "documentId": "POL-FEE-001",
+      "title": "Merchant Fee Schedule",
+      "section": "Cross-Network Settlement Fees",
+      "excerpt": "A cross-network settlement processing fee applies when ...",
+      "score": 1.5115
     }
   ]
 }
 ```
 
-The exact interpretation of retrieval score depends on the embedding/vector implementation.
-
-It should not be presented as probability or model confidence.
+`score` is a **deterministic lexical relevance score** — term overlap weighted by
+frequency damped for length, with extra weight for heading terms. There is no
+embedding and no vector index. It is not a probability and not model confidence,
+and is not exposed through any public API.
 
 ---
 
@@ -790,6 +693,41 @@ several investigations; it has at most one, enforced by a unique constraint on
 
 Were it added, it would live on the Investigation Service — which owns
 investigations — and return a single object or `404`, not a list.
+
+---
+
+## 17.1b List Investigations
+
+```http
+GET /api/v1/investigations
+```
+
+Served by the Investigation Service. Every investigation, newest first.
+
+```json
+{
+  "items": [
+    {
+      "investigation_id": "INV-1001",
+      "exception_id": "EX-1042",
+      "transaction_id": "TX-48291",
+      "exception_type": "AMOUNT_MISMATCH",
+      "status": "AWAITING_REVIEW",
+      "detected_at": "2026-09-26T14:32:00Z",
+      "created_at": "2026-09-26T14:32:01Z",
+      "updated_at": "2026-09-26T14:32:11Z"
+    }
+  ],
+  "total": 1
+}
+```
+
+Unpaginated: the table holds one row per detected discrepancy, and adding
+pagination before a client needs it would be guessing at the shape.
+
+There is deliberately **no create endpoint**. `POST /api/v1/investigations`
+returns `405`. Investigations exist because the Financial Core detected a
+discrepancy and said so on Kafka.
 
 ---
 
@@ -1188,7 +1126,10 @@ persisted or exposed anywhere in this system.
 
 ---
 
-# 22. Dashboard API
+# 22. Dashboard API — not implemented
+
+**This endpoint does not exist** in either service. It is planned for the
+Operations Console, which is itself not yet built.
 
 To avoid forcing the frontend to calculate operational statistics from raw records:
 
@@ -1210,25 +1151,30 @@ GET /api/v1/dashboard/summary
 }
 ```
 
-This endpoint is intended for the Operations Console.
+This endpoint is intended for the Operations Console. Note that it spans both
+services — transaction and exception counts come from the Financial Core, while
+`investigating`, `awaitingReview` and `escalated` are investigation states owned
+by the Investigation Service. Which service serves it, or whether the console
+composes two calls, is an open design question.
 
 ---
 
 # 23. Agent Tool Boundary
 
-The agent's allowed financial tools are:
+The agent's allowed tools are exactly these four, verified from
+`ALLOWED_TOOLS` in `agent-service/app/investigation_tools.py`:
 
 ```text
 get_transaction
 
-get_settlement
+get_settlements
 
 get_fee_rules
 
-get_transaction_history
-
 search_policy_documents
 ```
+
+`get_transaction_history` is **not** among them; see section 15.
 
 The agent must not have tools such as:
 
@@ -1449,7 +1395,7 @@ get_settlements()
 
 get_fee_rules()
 
-search_policies()
+search_policy_documents()
 ```
 
 Exactly four tools, all read-only. `get_transaction_history()` is not

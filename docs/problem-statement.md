@@ -502,6 +502,11 @@ get_transaction_history(merchant_id)
 search_policy_documents(query)
 ```
 
+> **Requirements document, not an implementation record.** As built, the
+> allowlist is four tools: `get_transaction`, `get_settlements` (plural),
+> `get_fee_rules` and `search_policy_documents`. `get_transaction_history` is
+> not implemented. See `docs/architecture.md` section 7 for what exists.
+
 The agent should not have unrestricted database access.
 
 Each tool represents a controlled interface to an authoritative information source.
