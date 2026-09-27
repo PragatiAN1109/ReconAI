@@ -178,3 +178,18 @@ def postgres_url() -> "Iterator[str]":
         alembic_config.set_main_option("sqlalchemy.url", url)
         command.upgrade(alembic_config, "head")
         yield url
+
+
+@pytest.fixture(scope="session")
+def policy_ids() -> set[str]:
+    """Document identifiers in the real policy corpus.
+
+    Session-scoped: the corpus is read-only and parsing it per test would be
+    pure waste.
+    """
+    from app.policy_search import PolicySearch  # noqa: PLC0415
+
+    from evals.run import policy_document_ids  # noqa: PLC0415
+
+    assert PolicySearch  # imported for the side effect of a clear failure if missing
+    return policy_document_ids(Settings(_env_file=None))
