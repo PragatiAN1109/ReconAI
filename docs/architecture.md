@@ -262,12 +262,17 @@ Investigation Service consumer
 Pydantic validation
         |
         v
-(investigation: not yet implemented)
+Investigation persisted (PENDING)
+        |
+        v
+(agent investigation: not yet implemented)
 ```
 
 **Why Kafka exists.** AI investigation has variable latency and independent failure modes. Placing a queue between detection and investigation means a slow, failing or entirely absent investigation service cannot affect whether the financial core establishes that two authoritative records disagree.
 
-The Python service consumes the topic under the fixed group `reconai-investigation-service`, with `auto.offset.reset=latest` and manual commits after each record. Delivery is at-least-once, so investigation handling must be idempotent by `exceptionId` once it exists. Today the consumer validates the event against the contract and logs it; nothing is investigated, fetched or persisted. See `agent-service/README.md` for the consumer's offset, readiness and error-handling behaviour.
+The Python service consumes the topic under the fixed group `reconai-investigation-service`, with `auto.offset.reset=latest` and manual commits after each record. Delivery is at-least-once, so investigation handling must be idempotent by `exceptionId` once it exists. A validated event becomes a `PENDING` investigation, at most one per `exceptionId` — enforced by a unique constraint rather than an application check, since duplicate deliveries can arrive concurrently. A record's offset is committed only once it has been recorded or judged permanently unusable; a valid event that cannot be stored leaves its offset uncommitted so it is redelivered rather than lost. Nothing beyond that happens: no evidence is fetched and no model is called.
+
+The investigation service owns the `investigation` schema and writes nowhere else. It never reads or writes `transactions`, `settlements` or `reconciliation_exceptions`, and holds no foreign keys into them; `exceptionId` and `transactionId` are references to be resolved through the financial core's API. See `agent-service/README.md` for offset, readiness and migration detail.
 
 ---
 

@@ -1,8 +1,8 @@
 """Kafka consumption of reconciliation exceptions.
 
-Owns the consumer's lifecycle and its loop. It knows nothing about HTTP, and
-the FastAPI layer knows nothing about Kafka beyond starting it, stopping it and
-asking whether it is running.
+Owns the consumer's lifecycle, its loop and its offsets. It knows nothing about
+HTTP, and the FastAPI layer knows nothing about Kafka beyond starting it,
+stopping it and asking whether it is running.
 """
 
 import asyncio
@@ -11,13 +11,19 @@ import logging
 from aiokafka import AIOKafkaConsumer
 
 from app.config import Settings
+from app.investigation_service import InvestigationService
 from app.message_handler import RecordLocation, handle_message
+from app.processing import ProcessingOutcome
 
 logger = logging.getLogger(__name__)
 
 
+class PersistenceUnavailableError(RuntimeError):
+    """A valid event could not be recorded, so its offset must not be committed."""
+
+
 class ReconciliationExceptionConsumer:
-    """Consumes ``reconciliation.exceptions`` and validates what it finds.
+    """Consumes ``reconciliation.exceptions`` and records an investigation for each.
 
     **Consumer group.** Fixed, from configuration. A stable group means offsets
     survive restarts and several instances share the partitions rather than each
@@ -29,22 +35,20 @@ class ReconciliationExceptionConsumer:
     topic on first connection. The practical consequence is that this consumer
     must already be running before an event is produced, or it will not see it.
 
-    **Commits.** Auto-commit is off and each record is committed after it has
-    been handled. Delivery is therefore **at-least-once**: a crash between
-    handling and committing replays the record. In this phase replay only
-    repeats a log line, but investigation handling in a later phase must be
-    idempotent by ``exceptionId``.
+    **Commits.** Auto-commit is off. A record is committed only once it has been
+    durably recorded, or once it has been judged permanently unusable. Delivery
+    is therefore **at-least-once**: a crash between the database commit and the
+    offset commit replays the record, and the unique ``exception_id`` makes that
+    replay reuse the existing investigation instead of creating a second one.
 
-    **Unusable records.** A record that cannot be decoded or validated is logged
-    and then *committed anyway*, which skips it. Without a dead-letter topic —
-    deliberately out of scope here — not committing would make the consumer
-    re-read the same poison record forever and stall the partition behind it.
-    The trade-off is that such a record is dropped, and the log line is the only
-    remaining trace of it.
+    The database commit and the Kafka commit are two separate transactions and
+    are **not** atomic. That window is real, and idempotency is what makes it
+    harmless rather than a duplicate investigation.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, investigation_service: InvestigationService) -> None:
         self._settings = settings
+        self._investigations = investigation_service
         self._consumer: AIOKafkaConsumer | None = None
         self._task: asyncio.Task[None] | None = None
 
@@ -94,8 +98,34 @@ class ReconciliationExceptionConsumer:
             self._consumer = None
             logger.info("Kafka consumer stopped [topic=%s]", self._settings.kafka_exceptions_topic)
 
+    async def process_record(self, raw: bytes | None, location: RecordLocation) -> ProcessingOutcome:
+        """Turn one record into an investigation, and report what to do with the offset.
+
+        Exposed separately from the loop so the decision — commit, skip or stop
+        — can be tested without Kafka.
+        """
+        event = handle_message(raw, location)
+        if event is None:
+            return ProcessingOutcome.INVALID
+
+        try:
+            await self._investigations.create_or_get(event)
+        except Exception:
+            logger.exception(
+                "Could not record investigation for a valid event; its offset will not be "
+                "committed and it will be redelivered "
+                "[exception_id=%s topic=%s partition=%d offset=%d]",
+                event.exception_id,
+                location.topic,
+                location.partition,
+                location.offset,
+            )
+            return ProcessingOutcome.RETRY_LATER
+
+        return ProcessingOutcome.PROCESSED
+
     async def _consume(self) -> None:
-        """Handle records until cancelled."""
+        """Handle records until cancelled, or until a record cannot be recorded."""
         assert self._consumer is not None
 
         try:
@@ -103,19 +133,19 @@ class ReconciliationExceptionConsumer:
                 location = RecordLocation(
                     topic=record.topic, partition=record.partition, offset=record.offset
                 )
-                try:
-                    handle_message(record.value, location)
-                except Exception:
-                    # handle_message is written not to raise. If it ever does,
-                    # one bad record still must not take down consumption.
-                    logger.exception(
-                        "Unexpected failure handling record [topic=%s partition=%d offset=%d]",
-                        location.topic,
-                        location.partition,
-                        location.offset,
+                outcome = await self.process_record(record.value, location)
+
+                if outcome is ProcessingOutcome.RETRY_LATER:
+                    # Committing here would acknowledge this record, because a
+                    # commit covers everything up to the current position. So
+                    # consumption stops instead. Readiness reports the instance
+                    # as not ready, and on restart the record is redelivered
+                    # from the last committed offset.
+                    raise PersistenceUnavailableError(
+                        f"Stopping consumption at {location.topic}-{location.partition}"
+                        f"@{location.offset}: the event was valid but could not be recorded"
                     )
-                # Committed whatever the outcome; see the class docstring on why
-                # an unusable record is skipped rather than retried forever.
+
                 await self._consumer.commit()
         except asyncio.CancelledError:
             logger.debug("Kafka consumer loop cancelled")

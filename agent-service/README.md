@@ -10,21 +10,23 @@ read-only interfaces when those are built.
 
 > Deterministic systems detect. AI investigates. Humans authorize.
 
-## Phase 4.2 scope
+## Phase 4.3 scope
 
-The service consumes reconciliation exceptions from Kafka, validates them against the
-contract the financial core publishes, and logs them. **It stops there** — nothing is
-investigated, fetched, persisted, or sent to a model. See
-[Not implemented yet](#not-implemented-yet).
+The service consumes reconciliation exceptions from Kafka, validates them, and records a
+`PENDING` investigation for each — exactly one per exception, however many times the
+event is delivered. **It stops there**: nothing is investigated, no evidence is fetched,
+no model is called. See [Not implemented yet](#not-implemented-yet).
 
 ## Prerequisites
 
 - **Python 3.12**
-- A Kafka broker, to actually consume events. The repository's Compose stack provides
-  one; see [Local startup order](#local-startup-order).
+- A Kafka broker and a PostgreSQL database. The repository's Compose stack provides
+  both; see [Local startup order](#local-startup-order).
 
-The **tests** need none of this. They fake the Kafka boundary and run offline, with no
-broker, database, backend, Docker, network or model provider.
+Most **tests** need none of this: they fake both boundaries and run offline. A smaller
+set is marked `integration` and starts a real PostgreSQL through Testcontainers, because
+unique constraints under concurrency and sequence behaviour cannot be proven against a
+substitute. Those skip automatically when Docker is unavailable.
 
 ## Setup
 
@@ -82,6 +84,12 @@ locally, so the service starts with nothing set.
 | `RECONAI_AGENT_KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | broker address |
 | `RECONAI_AGENT_KAFKA_EXCEPTIONS_TOPIC` | `reconciliation.exceptions` | topic to consume |
 | `RECONAI_AGENT_KAFKA_CONSUMER_GROUP` | `reconai-investigation-service` | consumer group |
+| `RECONAI_AGENT_DATABASE_URL` | `postgresql+asyncpg://reconai:reconai@localhost:55432/reconai` | database |
+
+The database port is **55432**, not 5432 — the Compose stack publishes PostgreSQL there
+so it does not collide with a local server. Keep it aligned with `RECONAI_POSTGRES_PORT`.
+The URL must use the `postgresql+asyncpg://` scheme; the financial core's JDBC URL is a
+different thing entirely.
 
 Values may also come from a `.env` file in this directory. There are **no secrets**: this
 phase talks to nothing that requires credentials.
@@ -159,11 +167,26 @@ The consumer group is fixed, never generated: a stable group keeps committed off
 across restarts and lets several instances share partitions instead of each receiving
 everything.
 
-Auto-commit is off; each record is committed after it has been handled. Delivery is
-therefore **at-least-once** — a crash between handling and committing replays the
-record. Today that only repeats a log line, but **investigation handling in a later
-phase must be idempotent by `exceptionId`.** This is not exactly-once and is not claimed
-to be.
+Auto-commit is off. A record is committed only once it has been durably recorded, or
+once it has been judged permanently unusable. There are three outcomes, and they differ
+in exactly one way — whether the offset moves:
+
+| Outcome | Offset | Why |
+|---|---|---|
+| Recorded | committed | the work is done |
+| Unusable message | committed, skipped | redelivery will not make it valid |
+| Valid, but could not be recorded | **not committed** | it must not be lost |
+
+The third case is the important one. A database outage must not silently discard a real
+financial exception, so the offset stays put and **consumption stops**. Kafka offsets are
+positional — committing acknowledges everything up to the current record — so continuing
+past a failed record would acknowledge it via the next successful commit. Readiness then
+reports `NOT_READY`, and on restart the record is redelivered.
+
+Delivery is **at-least-once**. The database commit and the Kafka commit are two separate
+transactions and are **not** atomic; a crash between them replays the record. The unique
+`exception_id` is what makes that replay harmless rather than a duplicate investigation.
+This is not exactly-once and is not claimed to be.
 
 ### Messages the service cannot use
 
@@ -176,6 +199,65 @@ committing would make the consumer re-read the same poison record forever and st
 every record behind it on that partition. The cost is that such a record is dropped and
 the log line is its only remaining trace.
 
+## Investigations
+
+A valid event becomes a durable investigation:
+
+```
+validated event ──▶ create or reuse ──▶ investigation.investigations
+                                         INV-1001, status=PENDING
+```
+
+Statuses are `PENDING`, `RUNNING`, `COMPLETED`, `FAILED` and `ESCALATED`. Kafka ingestion
+only ever creates `PENDING`. There is no agent yet, so nothing legitimately advances an
+investigation beyond it, and pretending otherwise would be inventing a result.
+
+### One investigation per exception
+
+`exception_id` carries a **unique constraint**. Not an application check — duplicate
+deliveries can arrive concurrently, and a read followed by a write would let two of them
+through. The insert itself resolves the race: the constraint decides, and the loser reads
+the winner's row.
+
+```
+EX-1008 first delivery   ──▶ created   INV-1001
+EX-1008 delivered again  ──▶ reused    INV-1001
+EX-1008 delivered again  ──▶ reused    INV-1001
+                              one row, always
+```
+
+Business identifiers come from a PostgreSQL sequence, the same approach the financial
+core uses for `TX-`, `SET-` and `EX-`. A sequence is safe across concurrent workers and
+process restarts, which an in-memory counter is not. Allocation is non-transactional, so
+a losing insert leaves a gap in the numbering; uniqueness matters and contiguity does not.
+
+### Database ownership
+
+This service owns the **`investigation` schema** and nothing else. The financial core's
+`transactions`, `settlements` and `reconciliation_exceptions` live in `public` in the
+same database and are never read, written or referenced by foreign key. `exception_id`
+and `transaction_id` are stored as plain identifiers — references to be resolved through
+the financial core's API later, not join keys.
+
+A separate schema makes that boundary something the database shows rather than something
+a reviewer has to take on trust.
+
+### Migrations
+
+This service owns its own migration history, entirely separate from the financial core's
+Flyway migrations.
+
+```bash
+alembic upgrade head       # apply
+alembic downgrade -1       # roll back one
+alembic current            # what is applied
+```
+
+The URL comes from `RECONAI_AGENT_DATABASE_URL`, so migrations and the running service
+cannot drift onto different databases. Tables are never created from ORM metadata at
+startup: a service that creates its own schema leaves no reviewable history of how it got
+that way.
+
 ## Endpoints
 
 ### `GET /health` — liveness
@@ -186,24 +268,45 @@ the log line is its only remaining trace.
 
 The process is running and serving requests.
 
+### `GET /api/v1/investigations` — list
+
+```json
+{"items": [{"investigation_id": "INV-1001", "exception_id": "EX-1008",
+            "transaction_id": "TX-10009", "exception_type": "AMOUNT_MISMATCH",
+            "status": "PENDING", "detected_at": "...", "created_at": "...",
+            "updated_at": "..."}], "total": 1}
+```
+
+### `GET /api/v1/investigations/{investigationId}` — one investigation
+
+`404` when it does not exist. The internal UUID is not exposed.
+
+There is deliberately **no create endpoint**. Investigations exist because the financial
+core detected a discrepancy and said so on Kafka; letting a caller assert one into
+existence would make this service a second, unverified source of truth.
+
 ### `GET /ready` — readiness
 
 ```json
-{"status": "READY", "service": "reconai-investigation-service", "kafka_consumer": "RUNNING"}
+{"status": "READY", "service": "reconai-investigation-service",
+ "kafka_consumer": "RUNNING", "database": "UP"}
 ```
 
-Kafka is now a real dependency, so readiness follows the consumer. It returns `200` only
-when the consumer connected at startup and its loop is still alive, and `503` otherwise:
+The job needs both Kafka and PostgreSQL, so readiness is `200` only when both are usable
+and `503` otherwise:
 
 ```json
-{"status": "NOT_READY", "service": "reconai-investigation-service", "kafka_consumer": "NOT_RUNNING"}
+{"status": "NOT_READY", "service": "reconai-investigation-service",
+ "kafka_consumer": "NOT_RUNNING", "database": "DOWN"}
 ```
 
-It reflects the consumer's own state rather than re-probing the broker on every call.
-That catches the failures that matter — a broker unreachable at startup, and a consumer
-loop that has died — without turning each readiness poll into broker traffic.
+The two are checked differently on purpose. Kafka is reported from the consumer's own
+state rather than re-probed, which catches what matters — a broker unreachable at
+startup, and a loop that has died — without turning every poll into broker traffic. The
+database gets a `SELECT 1` on a pooled connection, because a pool can be present while
+the server behind it is gone, and that is cheap enough to do per call.
 
-An unreachable broker does **not** stop the process from starting. Liveness stays up and
+Neither dependency being down stops the process from starting. Liveness stays up and
 readiness reports `NOT_READY`, so an orchestrator routes away from the instance instead
 of watching it crash-loop through an outage it cannot fix.
 
@@ -217,11 +320,15 @@ is listening is not delivered to a new consumer group.
 RECONAI_POSTGRES_PORT=55432 docker compose up -d
 ```
 ```bash
-# 2. This service, BEFORE producing anything
-cd agent-service && python -m app.main
+# 2. Apply this service's migrations (first run, or after pulling new ones)
+cd agent-service && alembic upgrade head
 ```
 ```bash
-# 3. The financial core, in another shell
+# 3. This service, BEFORE producing anything
+python -m app.main
+```
+```bash
+# 4. The financial core, in another shell
 cd backend && JAVA_HOME=$(/usr/libexec/java_home -v 21) \
   RECONAI_DB_URL=jdbc:postgresql://localhost:55432/reconai RECONAI_PORT=8099 \
   mvn spring-boot:run
@@ -249,9 +356,21 @@ The investigation service should log:
 INFO  [app.message_handler] Received reconciliation exception [exception_id=EX-1006 transaction_id=TX-10007 exception_type=AMOUNT_MISMATCH detected_at=2026-09-27T02:04:16.954772+00:00 topic=reconciliation.exceptions partition=0 offset=5]
 ```
 
+followed immediately by:
+
+```
+INFO  [app.investigation_service] Created investigation [investigation_id=INV-1001 exception_id=EX-1006 transaction_id=TX-10007 exception_type=AMOUNT_MISMATCH status=PENDING]
+```
+
+Read it back:
+
+```bash
+curl -s http://localhost:8000/api/v1/investigations
+```
+
 Reconciling the same unchanged records again reuses the exception and publishes nothing,
-so no further log line appears. That is correct: one investigation per discrepancy, not
-per API call.
+so no further log line appears. And if the same event is delivered again anyway, the
+consumer logs `Reusing existing investigation` and the table still holds one row.
 
 Inspect the group's position at any time:
 
@@ -302,8 +421,13 @@ core, any database access, investigation and recommendation persistence, fee rul
 embeddings, pgvector, approvals, audit workflow, authentication, a frontend, and
 autonomous actions of any kind.
 
-Also absent, and worth naming because they are the natural next questions about the
-consumer: dead-letter topics, retry infrastructure, and idempotency by `exceptionId`.
-An unusable message is skipped, and a replayed message would be processed twice.
+Also absent, and worth naming because they are the natural next questions:
+
+- **Dead-letter topics and retry infrastructure.** An unusable message is skipped and
+  lost beyond its log line. A storage outage stops consumption rather than retrying.
+- **Lifecycle transitions.** The statuses beyond `PENDING` exist in the schema but
+  nothing moves an investigation into them, and no transition rules are enforced yet.
+- **Atomic database and Kafka commits.** They are separate transactions; idempotency
+  covers the gap rather than closing it.
 
 No dependency for any of these is installed. They arrive in later sub-phases.

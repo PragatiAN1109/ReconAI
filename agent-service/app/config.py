@@ -40,3 +40,24 @@ class Settings(BaseSettings):
     # restarts and lets several instances share partitions instead of each one
     # receiving every event.
     kafka_consumer_group: str = "reconai-investigation-service"
+
+    # PostgreSQL. The async driver is part of the URL, so this must be an
+    # asyncpg URL rather than the psycopg one the financial core uses.
+    #
+    # The port is 55432, not 5432: the Compose stack publishes PostgreSQL there
+    # on machines that already run a local server on the default port. Keep this
+    # aligned with RECONAI_POSTGRES_PORT.
+    #
+    # Same database as the financial core, different schema. Shared storage is
+    # not shared ownership: this service reads and writes only "investigation".
+    database_url: str = "postgresql+asyncpg://reconai:reconai@localhost:55432/reconai"
+
+    @property
+    def redacted_database_url(self) -> str:
+        """The database URL with any password removed, safe to log."""
+        if "@" not in self.database_url:
+            return self.database_url
+        scheme_and_credentials, _, host_and_path = self.database_url.partition("@")
+        scheme, _, credentials = scheme_and_credentials.partition("://")
+        user = credentials.partition(":")[0]
+        return f"{scheme}://{user}:***@{host_and_path}"

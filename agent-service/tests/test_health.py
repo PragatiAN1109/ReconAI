@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.health import HealthResponse, ReadinessResponse
 from app.main import create_app
-from tests.conftest import FakeConsumer
+from tests.conftest import FakeConsumer, FakeDatabase
 
 
 def test_health_returns_200(client: TestClient) -> None:
@@ -39,6 +39,7 @@ def test_ready_reports_the_service_as_ready(client: TestClient) -> None:
         "status": "READY",
         "service": "reconai-investigation-service",
         "kafka_consumer": "RUNNING",
+        "database": "UP",
     }
 
 
@@ -48,6 +49,7 @@ def test_ready_response_matches_its_schema(client: TestClient) -> None:
     assert body.status == "READY"
     assert body.service == "reconai-investigation-service"
     assert body.kafka_consumer == "RUNNING"
+    assert body.database == "UP"
 
 
 def test_endpoints_return_json(client: TestClient) -> None:
@@ -60,7 +62,7 @@ def test_service_name_in_responses_comes_from_configuration() -> None:
 
     # A fake consumer is passed explicitly: without one this would construct the
     # real Kafka consumer and the test would depend on a running broker.
-    with TestClient(create_app(renamed, consumer=FakeConsumer())) as client:
+    with TestClient(create_app(renamed, consumer=FakeConsumer(), database=FakeDatabase())) as client:
         assert client.get("/health").json()["service"] == "renamed-service"
         assert client.get("/ready").json()["service"] == "renamed-service"
 
@@ -73,4 +75,5 @@ def test_no_business_endpoints_are_exposed_yet(client: TestClient) -> None:
     """Phase 4.1 is a scaffold: health and readiness are the whole surface."""
     paths = set(client.get("/openapi.json").json()["paths"])
 
-    assert paths == {"/health", "/ready"}
+    assert {"/health", "/ready"} <= paths
+    assert paths == {"/health", "/ready", "/api/v1/investigations", "/api/v1/investigations/{investigation_id}"}

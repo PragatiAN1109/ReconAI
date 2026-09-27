@@ -349,15 +349,18 @@ ESCALATED
 
 ## Purpose
 
-Represents an AI-assisted investigation of a reconciliation exception.
+Represents the durable investigation **case** for a reconciliation exception.
+
+An Investigation is the ongoing question "why does this discrepancy exist?" — not a
+single attempt at answering it. Processing the same exception again does not create
+another Investigation; it continues the existing one.
 
 The Investigation is separate from the exception because:
 
-- an exception is deterministic;
-- an investigation may fail;
-- an investigation may be retried;
-- future versions may support multiple investigations;
-- model/configuration versions may change.
+- an exception is deterministic, while its explanation is not;
+- an exception states what disagrees, and an investigation pursues why;
+- an investigation has a lifecycle of its own that outlives any one attempt; and
+- an investigation is advisory, and must never alter the exception it examines.
 
 ## Table
 
@@ -370,17 +373,28 @@ investigations
 | Field | Type | Required | Description |
 |---|---|---:|---|
 | id | UUID | Yes | Internal primary key |
-| investigation_id | VARCHAR(50) | Yes | Unique business ID |
-| exception_id | VARCHAR(50) | Yes | Exception being investigated |
+| investigation_id | VARCHAR(50) | Yes | Unique business ID, e.g. `INV-1001` |
+| exception_id | VARCHAR(50) | Yes | Exception being investigated; **UNIQUE** |
+| transaction_id | VARCHAR(50) | Yes | Transaction the exception concerns |
+| exception_type | VARCHAR(50) | Yes | Deterministic discrepancy type, carried from the event |
 | status | VARCHAR(30) | Yes | Investigation lifecycle |
-| model_provider | VARCHAR(50) | No | Model provider used |
-| model_name | VARCHAR(100) | No | Model used |
-| prompt_version | VARCHAR(50) | No | Investigation prompt version |
-| confidence | NUMERIC(5,4) | No | Final confidence value |
-| started_at | TIMESTAMPTZ | No | Investigation start |
-| completed_at | TIMESTAMPTZ | No | Investigation completion |
-| failure_reason | TEXT | No | Failure information |
-| created_at | TIMESTAMPTZ | Yes | Record creation time |
+| detected_at | TIMESTAMPTZ | Yes | When the financial core detected the discrepancy |
+| created_at | TIMESTAMPTZ | Yes | When this record was created |
+| updated_at | TIMESTAMPTZ | Yes | Last modification time |
+
+`exception_id` and `transaction_id` are business identifiers belonging to the financial
+core. They are stored as plain references, never as foreign keys: authoritative detail is
+retrieved through the financial core's API, not by joining across an ownership boundary.
+
+`detected_at` is deliberately distinct from `created_at`. The first is when the
+discrepancy existed; the second is when this service happened to hear about it.
+
+### Fields not present
+
+Model provider, model name, prompt version, confidence, start and completion times, and
+failure reason are **not** fields of Investigation. They describe a single execution
+attempt or its result, not the case, and belong to whichever execution and recommendation
+concepts are designed later.
 
 ## InvestigationStatus
 
@@ -392,13 +406,51 @@ FAILED
 ESCALATED
 ```
 
+Only `PENDING` is reachable today: the status is set when the case is opened, and nothing
+yet advances it.
+
 ## Relationship
 
 ```text
-ReconciliationException 1 ---- 0..* Investigation
+ReconciliationException 1 ---- 0..1 Investigation
 ```
 
-V1 normally creates one successful investigation per exception, but the data model allows retries.
+One reconciliation exception has **zero or one** Investigation.
+
+This is a deliberate choice, and the database enforces it with a unique constraint on
+`exception_id` rather than leaving it to application logic. Event delivery is
+at-least-once and duplicate deliveries can arrive concurrently, so a check-then-insert
+would let two through.
+
+The consequences are intentional:
+
+1. **A reconciliation exception has at most one Investigation.**
+2. **Redelivery or reprocessing reuses the existing Investigation** rather than opening a
+   second case for the same discrepancy.
+3. **Investigation identity is stable.** `INV-1001` refers to the same case for the
+   lifetime of the exception, however many times the event is processed, so anything that
+   references an investigation — a log line, an audit record, an analyst's note — stays
+   valid.
+
+### If execution history is needed later
+
+Retries, model versions and per-attempt timings are real concerns, and this model does not
+discard them. It says they are not *Investigations*. A second execution of an
+investigation is another attempt at one case, not a second case.
+
+Should that history be required, it belongs in a separate concept — `InvestigationRun` or
+`InvestigationAttempt` — related as:
+
+```text
+Investigation 1 ---- 0..* InvestigationRun
+```
+
+with the per-attempt fields listed under "Fields not present" living there. Creating
+several Investigation records for one exception would fragment the case, break the
+stability described above, and make "the investigation into EX-1042" ambiguous.
+
+**This is not implemented.** It is recorded here so the extension point is deliberate
+rather than discovered.
 
 ---
 
@@ -837,7 +889,7 @@ ReconciliationException
     |
     | 1
     |
-    | 0..*
+    | 0..1
     v
 Investigation
     |
@@ -1092,13 +1144,19 @@ Agent tools must not provide mutation operations against transactions or settlem
 
 Important state transitions must produce audit events.
 
-### Retry Support
+### Investigation Identity
 
-Multiple investigations may exist for the same reconciliation exception.
+A reconciliation exception has at most one Investigation, enforced by a unique constraint
+on `exception_id`. Reprocessing an exception continues the existing case rather than
+opening another, so an investigation identifier means the same thing forever.
+
+Retrying execution is a separate matter from creating a case; see section 6.
 
 ### Model Traceability
 
-Investigations should record the model, provider, and prompt version used to produce a recommendation.
+The model, provider and prompt version used to produce a recommendation must be recorded.
+They describe an execution rather than the investigation case, so they belong to the
+execution or recommendation concept, not to the Investigation record.
 
 ### Policy Traceability
 

@@ -21,6 +21,12 @@ dependencies = [
     # loop, and over kafka-python-ng, which is synchronous and less actively
     # maintained. Three pure-Python transitive dependencies.
     "aiokafka>=0.12,<1.0",
+    # SQLAlchemy 2.x async + asyncpg: the conventional async stack for FastAPI,
+    # and the only one of the mainstream options that speaks asyncio natively
+    # rather than through a thread pool. Alembic owns the migration history.
+    "sqlalchemy[asyncio]>=2.0,<3.0",
+    "asyncpg>=0.30,<1.0",
+    "alembic>=1.13,<2.0",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +35,11 @@ dev = [
     # Transport for fastapi.testclient.TestClient. Starlette now deprecates the
     # original httpx here and asks for httpx2, so using it keeps test runs clean.
     "httpx2>=2.0,<3.0",
+    "pytest-asyncio>=0.24,<2.0",
+    # Real PostgreSQL for the tests that depend on PostgreSQL semantics:
+    # unique constraints under concurrency, sequences, transaction behaviour.
+    # These tests skip automatically when Docker is unavailable.
+    "testcontainers[postgres]>=4.8,<5.0",
 ]
 
 [project.scripts]
@@ -40,3 +51,8 @@ include = ["app*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: needs a real PostgreSQL via Docker; skipped automatically without it",
+]

@@ -1,8 +1,10 @@
 """Shared test fixtures.
 
-Nothing here reaches outside the process: no Docker, no Kafka broker, no
-database, no network and no model provider. The Kafka boundary is faked, so the
-whole suite runs on a laptop with nothing else installed.
+Two kinds of test live here. Most fake the Kafka and database boundaries and
+run with nothing installed — no broker, no database, no network, no model
+provider. A smaller set is marked ``integration`` and uses a real PostgreSQL
+through Testcontainers, because unique constraints under concurrency, sequences
+and transaction behaviour cannot be proven against a substitute.
 """
 
 import pytest
@@ -41,6 +43,34 @@ class FakeConsumer:
         self._running = False
 
 
+class FakeDatabase:
+    """Stands in for the database at the lifecycle and readiness boundaries."""
+
+    def __init__(self, *, fail_on_connect: bool = False, healthy: bool = True) -> None:
+        self.fail_on_connect = fail_on_connect
+        self.healthy = healthy
+        self.connect_calls = 0
+        self.disconnect_calls = 0
+        self._connected = False
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    async def connect(self) -> None:
+        self.connect_calls += 1
+        if self.fail_on_connect:
+            raise ConnectionError("simulated database unavailable")
+        self._connected = True
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        self._connected = False
+
+    async def check(self) -> bool:
+        return self._connected and self.healthy
+
+
 @pytest.fixture
 def settings() -> Settings:
     """Explicit settings, so a stray environment variable cannot change a result."""
@@ -59,7 +89,12 @@ def consumer() -> FakeConsumer:
 
 
 @pytest.fixture
-def client(settings: Settings, consumer: FakeConsumer) -> TestClient:
-    """A client whose lifespan runs, so consumer startup is exercised too."""
-    with TestClient(create_app(settings, consumer=consumer)) as test_client:
+def database() -> FakeDatabase:
+    return FakeDatabase()
+
+
+@pytest.fixture
+def client(settings: Settings, consumer: FakeConsumer, database: FakeDatabase) -> TestClient:
+    """A client whose lifespan runs, so startup and shutdown are exercised too."""
+    with TestClient(create_app(settings, consumer=consumer, database=database)) as test_client:
         yield test_client

@@ -5,8 +5,9 @@ by the Spring Boot financial core. It is not a system of record: the financial
 core remains authoritative for transactions and settlements, and this service
 never writes to them.
 
-Phase 4.2 consumes reconciliation exceptions from Kafka and validates them.
-It stops there: nothing is investigated, fetched, persisted or sent to a model.
+Phase 4.3 consumes reconciliation exceptions from Kafka, validates them, and
+records a PENDING investigation for each. It stops there: nothing is
+investigated, no evidence is fetched, and no model is called.
 """
 
 import logging
@@ -17,7 +18,10 @@ import uvicorn
 from fastapi import FastAPI
 
 from app.config import Settings
+from app.database import Database
 from app.health import router as health_router
+from app.investigation_service import InvestigationService
+from app.investigations_api import router as investigations_router
 from app.kafka_consumer import ReconciliationExceptionConsumer
 from app.logging_config import configure_logging
 
@@ -32,16 +36,19 @@ DESCRIPTION = (
 def create_app(
     settings: Settings | None = None,
     consumer: ReconciliationExceptionConsumer | None = None,
+    database: Database | None = None,
 ) -> FastAPI:
     """Build the application.
 
-    Settings and the consumer are parameters rather than module-level
-    singletons so that tests can supply their own, without global state, cache
-    clearing or a broker.
+    Settings, the consumer and the database are parameters rather than
+    module-level singletons so that tests can supply their own, without global
+    state, cache clearing, a broker or a database.
     """
     settings = settings or Settings()
     configure_logging(settings.log_level)
-    consumer = consumer or ReconciliationExceptionConsumer(settings)
+    database = database or Database(settings)
+    investigations = InvestigationService(database)
+    consumer = consumer or ReconciliationExceptionConsumer(settings, investigations)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -52,6 +59,17 @@ def create_app(
             settings.host,
             settings.port,
         )
+        # The database comes up before the consumer: recording an investigation
+        # is the only thing consuming an event is for, so there is no value in
+        # pulling events we cannot store.
+        try:
+            await database.connect()
+        except Exception:
+            logger.exception(
+                "Database failed to connect; the service will report itself as not ready [url=%s]",
+                settings.redacted_database_url,
+            )
+
         try:
             await consumer.start()
         except Exception:
@@ -69,18 +87,24 @@ def create_app(
         try:
             yield
         finally:
+            # Reverse order: stop consuming before closing the pool the
+            # consumer writes through.
             await consumer.stop()
+            await database.disconnect()
             logger.info("Investigation service stopped [service=%s]", settings.service_name)
 
     app = FastAPI(
         title="ReconAI Investigation Service",
         description=DESCRIPTION,
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan,
     )
     app.state.settings = settings
     app.state.consumer = consumer
+    app.state.database = database
+    app.state.investigations = investigations
     app.include_router(health_router)
+    app.include_router(investigations_router)
     return app
 
 
