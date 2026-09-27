@@ -92,8 +92,16 @@ class FakeFinancialCore:
 
 @pytest.fixture
 def settings() -> Settings:
-    """Explicit settings, so a stray environment variable cannot change a result."""
+    """Explicit settings, so a stray environment variable cannot change a result.
+
+    ``_env_file=None`` is what makes that true, and it is not optional. Without
+    it these settings read ``agent-service/.env``, so a developer who has
+    configured a real provider gets a different application under test than CI
+    does — and tests that assert "no model is configured" fail on their machine
+    only. Worse, a test that reached the provider would spend real money.
+    """
     return Settings(
+        _env_file=None,
         service_name="reconai-investigation-service",
         environment="test",
         host="127.0.0.1",

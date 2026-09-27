@@ -196,3 +196,44 @@ def test_an_unusable_timeout_is_rejected() -> None:
         Settings(_env_file=None, financial_core_timeout_seconds=0)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, financial_core_timeout_seconds=-1)
+
+
+def test_the_shared_test_settings_never_enable_a_provider(settings: Settings) -> None:
+    """The suite must not depend on whether a developer has credentials configured.
+
+    A real ``agent-service/.env`` is read by ``Settings`` unless ``_env_file`` is
+    disabled. Without this guarantee the application under test differs between
+    a developer's machine and CI: tests asserting "no model is configured" fail
+    only locally, and — far worse — a test that reached the provider would make
+    a live, billable call.
+
+    This asserts the property directly rather than the mechanism, so it holds
+    however the fixture is built.
+    """
+    assert settings.llm_provider == "none"
+    assert settings.llm_api_key is None
+    assert settings.investigation_model_configured is False
+
+
+def test_the_shared_test_settings_ignore_a_real_env_file(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    """Proven against an actual .env on disk, not just the current environment.
+
+    The regression this guards against only appears when the file exists, which
+    is exactly when nobody is looking: it is created once, locally, to run the
+    provider for real.
+    """
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "RECONAI_AGENT_LLM_PROVIDER=anthropic\n"
+        "RECONAI_AGENT_LLM_API_KEY=not-a-real-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    # Reading the file is what a default construction does...
+    assert Settings().investigation_model_configured is True
+    # ...and what the suite's settings must never do.
+    assert Settings(_env_file=None).investigation_model_configured is False
+    assert settings.investigation_model_configured is False

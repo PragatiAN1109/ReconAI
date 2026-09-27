@@ -58,7 +58,7 @@ def test_endpoints_return_json(client: TestClient) -> None:
 
 
 def test_service_name_in_responses_comes_from_configuration() -> None:
-    renamed = Settings(service_name="renamed-service", environment="test")
+    renamed = Settings(_env_file=None, service_name="renamed-service", environment="test")
 
     # A fake consumer is passed explicitly: without one this would construct the
     # real Kafka consumer and the test would depend on a running broker.
