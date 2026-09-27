@@ -9,7 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import Database
 from app.events import ReconciliationExceptionEvent
-from app.models import SCHEMA, Investigation, InvestigationStatus
+from app.models import (
+    SCHEMA,
+    Investigation,
+    InvestigationStatus,
+    Recommendation,
+    RecommendationEvidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +139,39 @@ class InvestigationService:
             result = await session.scalars(
                 select(Investigation).order_by(
                     Investigation.created_at.desc(), Investigation.investigation_id.asc()
+                )
+            )
+            return list(result)
+
+    async def get_recommendation(self, investigation_id: str) -> Recommendation | None:
+        """The AI's conclusion, if one has been recorded.
+
+        None until a run completes, and never more than one: the unique
+        constraint on ``investigation_id`` is what makes "the recommendation"
+        a well-defined phrase.
+        """
+        async with self._database.session() as session:
+            return await session.scalar(
+                select(Recommendation).where(
+                    Recommendation.investigation_id == investigation_id
+                )
+            )
+
+    async def get_evidence(self, recommendation_id: str) -> list[RecommendationEvidence]:
+        """The verified references behind one recommendation.
+
+        Ordered for a stable reading: by source type, then reference, then
+        section. The order evidence was cited in carries no meaning, so a
+        deterministic one is better than an arbitrary one.
+        """
+        async with self._database.session() as session:
+            result = await session.scalars(
+                select(RecommendationEvidence)
+                .where(RecommendationEvidence.recommendation_id == recommendation_id)
+                .order_by(
+                    RecommendationEvidence.source_type.asc(),
+                    RecommendationEvidence.reference.asc(),
+                    RecommendationEvidence.section.asc().nullsfirst(),
                 )
             )
             return list(result)

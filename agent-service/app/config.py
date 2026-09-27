@@ -1,5 +1,6 @@
 """Typed configuration for the investigation service."""
 
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
@@ -84,6 +85,26 @@ class Settings(BaseSettings):
     #: Upper bound on tool rounds in one investigation. An unbounded agent loop
     #: is an unbounded bill.
     investigation_max_tool_rounds: int = Field(default=8, ge=1, le=20)
+    #: Recorded on every recommendation so a stored conclusion can be traced to
+    #: the instructions that produced it. Bump it whenever SYSTEM_PROMPT changes
+    #: in a way that could change results.
+    prompt_version: str = "v1"
+
+    # Guardrail policy. Deterministic and configurable: an operator sets how
+    # cautious the routing is, and the same result always routes the same way.
+    #
+    # Decimal, not float, because this is compared against a stored NUMERIC
+    # confidence and a threshold of 0.85 should mean exactly that.
+    #
+    # The confidence being compared is the model's own self-report. It is an
+    # ordering signal, not a calibrated probability, and the threshold is an
+    # operational choice rather than a statistical one.
+    review_confidence_threshold: Decimal = Field(
+        default=Decimal("0.85"), ge=Decimal("0"), le=Decimal("1")
+    )
+    #: A conclusion citing nothing verifiable goes to a human regardless of how
+    #: confident it claims to be.
+    review_minimum_evidence: int = Field(default=1, ge=0, le=20)
 
     @property
     def investigation_model_configured(self) -> bool:

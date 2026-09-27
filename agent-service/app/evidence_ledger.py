@@ -29,6 +29,11 @@ class EvidenceLedger:
     #: Policy documents, and the specific sections retrieved from each.
     policy_documents: set[str] = field(default_factory=set)
     policy_sections: set[tuple[str, str]] = field(default_factory=set)
+    #: The text of each retrieved section, keyed by (document, section).
+    #: Kept so a cited excerpt can be stored with the recommendation: a reviewer
+    #: reading it months later should see the words the investigation actually
+    #: saw, not whatever the corpus says by then.
+    policy_excerpts: dict[tuple[str, str], str] = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
@@ -54,6 +59,7 @@ class EvidenceLedger:
         for policy in policies:
             self.policy_documents.add(policy.document_id)
             self.policy_sections.add((policy.document_id, policy.section))
+            self.policy_excerpts[(policy.document_id, policy.section)] = policy.excerpt
 
     def supports(self, reference: EvidenceReference) -> bool:
         """True when this reference points at evidence actually retrieved.
@@ -74,6 +80,20 @@ class EvidenceLedger:
                     return (reference.reference, reference.section) in self.policy_sections
                 return reference.reference in self.policy_documents
         return False  # pragma: no cover - the enum is exhaustive
+
+    def excerpt_for(self, reference: EvidenceReference) -> str | None:
+        """The retrieved text behind a policy citation, if there is one.
+
+        Only policy evidence has an excerpt. Financial records are cited by
+        identifier and can be re-read from the financial core, which remains
+        their source of truth; copying their values here would create a second
+        one that silently goes stale.
+        """
+        if reference.source_type is not EvidenceSource.POLICY_DOCUMENT:
+            return None
+        if reference.section is None:
+            return None
+        return self.policy_excerpts.get((reference.reference, reference.section))
 
     def ungrounded(self, references: list[EvidenceReference]) -> list[EvidenceReference]:
         """The references this ledger cannot vouch for."""

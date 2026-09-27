@@ -10,7 +10,17 @@ read-only interfaces when those are built.
 
 > Deterministic systems detect. AI investigates. Humans authorize.
 
-## Phase 4.6 scope
+## Phase 4.7 scope
+
+The complete backend lifecycle, end to end:
+
+```
+Kafka event ──▶ PENDING ──▶ RUNNING ──▶ AWAITING_REVIEW ──▶ COMPLETED
+                              │              │  (human approves)
+                              │              └──▶ ESCALATED (human rejects/escalates)
+                              ├──▶ ESCALATED (guardrail)
+                              └──▶ FAILED
+```
 
 The service consumes reconciliation exceptions from Kafka and records a `PENDING`
 investigation for each. A recorded investigation can then be **run**: a language model
@@ -18,9 +28,12 @@ requests evidence through four controlled tools, reasons over what comes back, a
 proposes an explanation — which the application checks against the evidence actually
 retrieved before accepting it.
 
-**Results are not persisted and no lifecycle advances.** Running an investigation twice
-runs it twice and changes nothing either time. See
-[Not implemented yet](#not-implemented-yet).
+The result is **durably stored**, a **deterministic guardrail** routes it to a human or
+escalates it, a **human decides**, and every step lands in an **append-only audit trail**.
+
+**Only a human reaches `COMPLETED`.** No confidence value is a shortcut, and approving a
+recommendation writes nothing to the financial core. See
+[Human review](#human-review) and [Not implemented yet](#not-implemented-yet).
 
 ## Prerequisites
 
@@ -97,6 +110,9 @@ locally, so the service starts with nothing set.
 | `RECONAI_AGENT_LLM_MODEL` | `claude-sonnet-5` | model identifier |
 | `RECONAI_AGENT_LLM_API_KEY` | *(unset)* | provider key; `SecretStr`, never logged |
 | `RECONAI_AGENT_INVESTIGATION_MAX_TOOL_ROUNDS` | `8` | bound on the tool loop |
+| `RECONAI_AGENT_PROMPT_VERSION` | `v1` | recorded on every recommendation |
+| `RECONAI_AGENT_REVIEW_CONFIDENCE_THRESHOLD` | `0.85` | guardrail: minimum confidence for human review |
+| `RECONAI_AGENT_REVIEW_MINIMUM_EVIDENCE` | `1` | guardrail: minimum verified evidence references |
 
 The provider defaults to `none`. The service runs, consumes Kafka and records
 investigations with no model configured at all; only the investigation endpoint is
@@ -111,8 +127,10 @@ so it does not collide with a local server. Keep it aligned with `RECONAI_POSTGR
 The URL must use the `postgresql+asyncpg://` scheme; the financial core's JDBC URL is a
 different thing entirely.
 
-Values may also come from a `.env` file in this directory. There are **no secrets**: this
-phase talks to nothing that requires credentials.
+Values may also come from a `.env` file in this directory. `RECONAI_AGENT_LLM_API_KEY`
+**is** a secret when a provider is configured — keep it out of anything committed. It is
+a `SecretStr`, so it cannot be printed by an accidental `repr` of settings, and it is
+never logged.
 
 Example:
 
@@ -228,9 +246,10 @@ validated event ──▶ create or reuse ──▶ investigation.investigations
                                          INV-1001, status=PENDING
 ```
 
-Statuses are `PENDING`, `RUNNING`, `COMPLETED`, `FAILED` and `ESCALATED`. Kafka ingestion
-only ever creates `PENDING`. There is no agent yet, so nothing legitimately advances an
-investigation beyond it, and pretending otherwise would be inventing a result.
+Statuses are `PENDING`, `RUNNING`, `AWAITING_REVIEW`, `COMPLETED`, `FAILED` and
+`ESCALATED`. Kafka ingestion only ever creates `PENDING`; running the investigation and
+reviewing it move it onward. Every transition is made by application code — the model
+proposes an explanation and never decides what state the workflow is in.
 
 ### One investigation per exception
 
@@ -272,6 +291,13 @@ alembic upgrade head       # apply
 alembic downgrade -1       # roll back one
 alembic current            # what is applied
 ```
+
+| Revision | What it creates |
+|---|---|
+| `0001` | the `investigation` schema and `investigations` |
+| `0002` | `recommendations`, `recommendation_evidence`, `reviews`, `audit_events`; widens the status constraint to admit `AWAITING_REVIEW` |
+
+Migration files live in `migrations/versions/` (not `alembic/`).
 
 The URL comes from `RECONAI_AGENT_DATABASE_URL`, so migrations and the running service
 cannot drift onto different databases. Tables are never created from ORM metadata at
@@ -487,10 +513,14 @@ Reconciliation says `AMOUNT_MISMATCH` — two records disagree. An investigation
 `PROCESSOR_FEE` — here is why. `PROCESSOR_FEE` is not and will never be a reconciliation
 exception type.
 
-`requiresHumanApproval` is pinned true by a validator: a result cannot describe itself as
-needing no review. `confidence` is the model's stated confidence, range-checked and
-nothing more — it is not calibrated, and nothing is approved or rejected on the strength
-of it.
+`requiresHumanApproval` is pinned true by a validator and independently by a database
+`CHECK` constraint: a result cannot describe itself as needing no review.
+
+`confidence` is the model's stated confidence, range-checked and nothing more. It is
+**not calibrated**, and nothing is ever approved on the strength of it — it is compared
+against a configured threshold to decide whether a human sees the recommendation or the
+investigation is escalated, and that is its entire role. See
+[Guardrails](#guardrails).
 
 ### Evidence grounding
 
@@ -547,6 +577,248 @@ RECONAI_AGENT_LLM_PROVIDER=anthropic RECONAI_AGENT_LLM_API_KEY=... python -m app
 were available when it was written, so the translation in `app/anthropic_model.py` is
 unexercised end to end. Treat the first real run as a verification step.
 
+## Persisting the result
+
+A completed run stores four things, in one transaction:
+
+```
+recommendations           the conclusion  (REC-3001)
+recommendation_evidence   the verified references behind it
+investigations.status     AWAITING_REVIEW or ESCALATED
+audit_events              what happened, and who caused it
+```
+
+They commit together because they are one fact. A recommendation with no status change
+is invisible; a status change with no recommendation is unexplainable.
+
+### One conclusion per investigation
+
+`UNIQUE(investigation_id)` on `recommendations`. A second would make "the AI's
+conclusion" an ambiguous phrase.
+
+### What is deliberately not stored
+
+The prompt, the provider's request or response, and anything resembling model reasoning.
+**Private chain-of-thought is never requested, persisted or exposed.** What is kept is
+the structured result a reviewer needs, plus enough metadata — provider, model, prompt
+version — to know what produced it.
+
+### Confidence
+
+Stored as `NUMERIC(5,4)`, never a float, so it reads back as what was written and a
+threshold comparison cannot turn on binary rounding.
+
+It is the model's **self-report**. It is *not* a calibrated probability: 0.9 does not
+mean nine such conclusions in ten are correct. It is used only as an ordering signal
+against a configured threshold, and every API response carrying it says so.
+
+### Database-enforced invariants
+
+```sql
+CHECK requires_human_approval = true
+CHECK confidence BETWEEN 0 AND 1
+CHECK classification IN (the seven root-cause values)
+```
+
+The first is the important one: a recommendation that did not require human approval
+would be an autonomous decision, and the database refuses to store one even if every
+layer of application code were wrong.
+
+## Transaction boundaries
+
+A model call is slow, external, and cannot join a database transaction. Wrapping the
+workflow in one would mean holding a row lock open across a network call to a third
+party. So the run is three short transactions with the call between them:
+
+```
+TX1   claim PENDING → RUNNING, audit INVESTIGATION_STARTED       commit
+        │
+        │   no transaction open
+        ▼
+      agent: bounded tool loop, model call, grounding validation
+        │
+        ▼
+TX2   recommendation + evidence + status + audit                 commit
+```
+
+On failure, a third transaction records `FAILED` and the reason.
+
+TX2 is **one transaction**. The recommendation, every evidence row, the guardrail's status
+transition and both success audit events succeed or fail together. If any of them fails,
+the whole transaction rolls back — no partial recommendation, no orphan evidence, no
+misleading `AI_RESULT_GENERATED` or `AWAITING_REVIEW` audit — and a separate transaction
+then records `RUNNING → FAILED`. This is proven in `tests/test_transaction_atomicity.py`
+by injecting real PostgreSQL failures mid-transaction, not by mocking.
+
+**The database and the model are not atomic together, and nothing here pretends they
+are.** A *crash* between TX1 and TX2 leaves the investigation `RUNNING` — no failure
+handler gets to run — which is a visible, honest state meaning "started, outcome unknown".
+Recovering from it is a deliberate operational decision; there is no background scheduler
+and no distributed lock to quietly undo it.
+
+### Concurrency
+
+Claiming is a conditional update:
+
+```sql
+UPDATE investigations SET status = 'RUNNING'
+ WHERE investigation_id = :id AND status = 'PENDING'
+RETURNING *
+```
+
+Two simultaneous requests both pass any read-based check; only one can win this, because
+the database serialises the row. The loser gets zero rows and a `409` — **before** any
+model call is made, so a rejected run costs nothing.
+
+Tested with eight concurrent runs against a real PostgreSQL: exactly one recommendation,
+exactly one agent invocation. A concurrency guarantee demonstrated against a mock is a
+guarantee about the mock.
+
+## Guardrails
+
+Deterministic routing between human review and escalation. No model call, no network, no
+randomness — the same result always routes the same way, which is what makes an
+escalation explainable months later.
+
+```
+classification is INSUFFICIENT_EVIDENCE or UNKNOWN
+    → ESCALATED    checked first: the model has said it does not know,
+                   and no confidence number changes that
+
+fewer verified evidence references than the minimum
+    → ESCALATED    a conclusion citing nothing verifiable needs a human
+                   however confident it sounds
+
+confidence < threshold
+    → ESCALATED
+
+otherwise
+    → AWAITING_REVIEW
+```
+
+Both parameters are configurable (`RECONAI_AGENT_REVIEW_CONFIDENCE_THRESHOLD`,
+`RECONAI_AGENT_REVIEW_MINIMUM_EVIDENCE`). The reason — quoting the threshold applied — is
+stored with the outcome, so the decision can be re-derived from the record rather than
+reconstructed from whatever the code says later.
+
+**The guardrail has exactly two outcomes.** Neither is `COMPLETED`. Nothing in this
+module can complete an investigation.
+
+**Escalation is not failure.** It is the system declining to present a weak explanation
+as a finding, and it is the expected outcome whenever the evidence does not carry the
+conclusion. The reasoning is still stored, so a human picking it up starts from what was
+found rather than from nothing.
+
+## Human review
+
+This is where authority lives.
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/investigations/INV-1001/approve \
+  -H 'content-type: application/json' \
+  -d '{"reviewed_by": "ops.analyst", "comment": "Fee rule matches the difference."}'
+```
+
+| Decision | Investigation becomes | Meaning |
+|---|---|---|
+| `approve` | `COMPLETED` | a human accepted the explanation |
+| `reject` | `ESCALATED` | the explanation was not accepted |
+| `escalate` | `ESCALATED` | the reviewer passed it on rather than deciding |
+
+Rejection **escalates rather than resolving**. A rejected recommendation does not make
+the discrepancy disappear — the exception is still there and still needs a human. What
+was rejected is one proposed explanation of it.
+
+Rejection and escalation are kept distinct because they say different things to whoever
+picks it up next: one judges the explanation wrong, the other judges it above this
+reviewer's authority.
+
+### Approval does not act
+
+**No review endpoint calls the financial core.** Not `POST`, not `PUT`, not `PATCH`, not
+`DELETE`. `ReviewService` holds no client to it at all — the boundary is structural, not
+a rule to remember, and a test asserts the object's only attribute is its database.
+
+Approving records that a human judged an explanation acceptable. It does not resolve the
+exception, alter a settlement, or move money. Acting on an approved recommendation is a
+separate, deliberate step outside this service.
+
+### Reviewer identity is not authenticated
+
+**There is no authentication in this service.** `reviewed_by` is whatever the caller
+sends, stored verbatim and returned alongside a `reviewer_note` saying it is unverified.
+It is demo attribution, not identity. Nothing should be built on it that assumes
+otherwise.
+
+It is required and must be non-empty: unauthenticated is not the same as anonymous.
+
+### One decision, once
+
+`UNIQUE(investigation_id)` on `reviews`, plus the same conditional-update pattern used
+for claiming a run. Two reviewers pressing approve simultaneously result in exactly one
+stored decision — the first. A decision that could be silently overwritten would not be
+a decision.
+
+The decision is also **one transaction**: the review row, the status transition and the
+audit event commit together. A failure in any of them leaves the investigation
+`AWAITING_REVIEW` with no review recorded, so the reviewer can simply try again — never
+`COMPLETED` with nobody accountable for it.
+
+Only an investigation that is `AWAITING_REVIEW` can be decided. An `ESCALATED` one cannot
+be approved: the guardrail already routed it away from recommendation review toward a
+human investigating it directly, which is a different activity with a different outcome.
+
+## Audit trail
+
+Append-only, one row per significant event, scoped to one investigation.
+
+```
+AUD-9001  INVESTIGATION_STARTED          SYSTEM
+AUD-9002  AI_RESULT_GENERATED            AI
+AUD-9003  INVESTIGATION_AWAITING_REVIEW  SYSTEM   reason, threshold applied
+AUD-9004  REVIEW_APPROVED                HUMAN    ops.analyst
+```
+
+`actor_type` is `SYSTEM`, `AI` or `HUMAN` — the question an audit trail exists to answer
+is who did what. `actor_id` is set only for human events and carries the same
+unauthenticated caller-supplied name as `reviewed_by`.
+
+### Append-only by absence
+
+There is no update path and no delete path — not in the service, not in the API. `POST`,
+`PUT` and `DELETE` on the audit endpoint all return `405`. `AuditService` exposes exactly
+one public method, `list_for_investigation`; appending is a module-level function that
+takes a caller's session, so there is no object offering a tempting `delete` next to a
+`read`. A trail that can be revised is not evidence of anything.
+
+### Committed with what it describes
+
+Each event is written in the same transaction as the state change it records. An audit
+entry surviving a rolled-back transition would be a record of something that never
+happened — there is a test that forces exactly that rollback.
+
+### Ordered by an integer sequence
+
+Not by timestamp, which ties when several events share a transaction, and not by
+identifier text, which would sort `AUD-10001` before `AUD-9001`. `occurred_at` uses
+`clock_timestamp()` rather than `now()`, so it records when the event happened rather
+than when its transaction began.
+
+### Deliberately few event types
+
+Eight. `TOOL_CALLED` and `EVIDENCE_RETRIEVED` are **not** audited: a durable row per tool
+call would bury the events a reviewer actually needs, and what the tools returned is
+already recorded — verified — as recommendation evidence. Tool activity is logged, not
+audited. An audit trail nobody can read is not an audit trail.
+
+### What metadata never contains
+
+A classification, a confidence, an evidence count, a guardrail reason, a failure
+category — enough to re-derive why something was routed where it was.
+
+Never a prompt, a provider payload, a credential, or model reasoning. This table is read
+by humans reviewing decisions; it is not a debugging sink.
+
 ## Endpoints
 
 ### `GET /health` — liveness
@@ -573,6 +845,60 @@ The process is running and serving requests.
 There is deliberately **no create endpoint**. Investigations exist because the financial
 core detected a discrepancy and said so on Kafka; letting a caller assert one into
 existence would make this service a second, unverified source of truth.
+
+### `POST /api/v1/investigations/{investigationId}/run` — investigate
+
+Runs the bounded loop, validates the result, stores it, and routes it.
+
+```json
+{
+  "investigation_id": "INV-1001",
+  "status": "AWAITING_REVIEW",
+  "guardrail_reason": "Reported confidence 0.8600 meets the review threshold 0.85 with 3 verified evidence reference(s); awaiting human approval.",
+  "recommendation": {"recommendation_id": "REC-3001", "classification": "PROCESSOR_FEE", "...": "..."},
+  "evidence_retrieved": {"transactions": ["TX-10009"], "settlements": ["SET-8008"],
+                         "feeRules": ["FR-14"], "policyDocuments": ["POL-FEE-001"]}
+}
+```
+
+`status` is `AWAITING_REVIEW` or `ESCALATED`, **never `COMPLETED`**.
+
+| Code | Meaning |
+|---:|---|
+| 200 | ran; result stored and routed |
+| 404 | no such investigation |
+| 409 | not `PENDING` — already running, concluded, or reviewed |
+| 422 | malformed result, or one citing evidence never retrieved |
+| 503 | no model configured, or the provider could not be reached |
+
+A `422` stores no recommendation at all. The investigation moves to `FAILED` and the
+reason goes in the audit trail; no placeholder conclusion is invented.
+
+### `GET /api/v1/investigations/{investigationId}/recommendation` — the stored conclusion
+
+Returns the recommendation with its verified evidence. `404` while an investigation is
+still `PENDING` or `RUNNING`: there is genuinely no conclusion yet, and an empty one
+would invite a client to render something nobody concluded.
+
+### `POST .../approve`, `.../reject`, `.../escalate` — human decisions
+
+```json
+{"reviewed_by": "ops.analyst", "comment": "Fee rule matches the difference."}
+```
+
+| Code | Meaning |
+|---:|---|
+| 200 | decision recorded |
+| 404 | no such investigation |
+| 409 | not `AWAITING_REVIEW`, or already reviewed |
+| 422 | `reviewed_by` missing or empty |
+
+`409` rather than `400` for a state conflict: the request is well-formed, and it is the
+state of the investigation that makes it impossible.
+
+### `GET /api/v1/investigations/{investigationId}/audit` — the trail
+
+Oldest first. Read-only — `POST`, `PUT` and `DELETE` return `405`.
 
 ### `GET /ready` — readiness
 
@@ -706,32 +1032,48 @@ alongside the stack rather than run from a shell.
 
 ## Not implemented yet
 
-Kafka consumption now works. **AI investigation does not.** A validated event is logged
-and that is the end of it.
+The backend lifecycle is complete: an exception detected by the financial core becomes an
+investigation, is investigated, is stored, is routed by policy, is decided by a human, and
+is auditable throughout.
 
-`get_transaction` and `get_settlements` exist, but **nothing calls them automatically**.
-An investigation stays `PENDING`; there is no orchestrator.
+**There is no frontend.** The React Operations Console that will call these endpoints is
+the next phase. The endpoints exist and are tested; nothing renders them.
 
-An investigation can now propose an explanation. **Nothing is done with it.** The result
-is returned to the caller and discarded.
+Absent by design:
 
-Absent by design: result persistence, investigation evidence persistence, recommendation
-persistence, investigation lifecycle transitions (a run leaves the investigation
-`PENDING`), human approval workflow, confidence-threshold automation, automatic approval
-or escalation, audit events, `get_transaction_history`, semantic search, embeddings,
-vector stores, pgvector, multiple agents, a frontend, financial writes of any kind, and
-autonomous action of any kind.
+- **Authentication and authorization.** `reviewed_by` is caller-supplied and unverified.
+  There is no login, no session, no role, and no check that the person approving is
+  entitled to. This is a demo boundary and is documented as one everywhere it appears.
+- **Any write to the financial core.** Approval records a judgement; it does not resolve
+  an exception, adjust a settlement, or move money. No code path here can.
+- **Automatic approval or autonomous action of any kind.** The guardrail routes; it never
+  decides. Only a human transition reaches `COMPLETED`.
+- **Retrying a failed or stuck investigation.** A `FAILED` one stays failed and a crashed
+  one stays `RUNNING`. There is no scheduler, no background worker, no retry queue and no
+  distributed lock. Recovery is a deliberate operational act, which is the honest
+  position until there is an operator to define what recovery should mean.
+- **Execution-attempt history.** One investigation has at most one recommendation. If the
+  history of attempts is needed later it should be a separate concept — an
+  `InvestigationRun` — not extra columns on the investigation.
+- **Dead-letter topics and retry infrastructure.** An unusable Kafka message is skipped
+  and lost beyond its log line. A storage outage stops consumption rather than retrying.
+- **Atomic database and Kafka commits.** They are separate transactions; idempotency
+  covers the gap rather than closing it. Delivery is at-least-once and is not claimed to
+  be more.
+- **Deployment.** The service is not in the root `docker-compose.yml`.
+- `get_transaction_history`, semantic search, embeddings, vector stores, pgvector, and
+  multiple agents.
 
 `PROCESSOR_FEE` remains a root-cause classification an investigation may propose. It is
-not, and must not become, a deterministic reconciliation exception type.
+not, and must not become, a deterministic reconciliation exception type — enforced in the
+Java enum, the Python enum, and a PostgreSQL `CHECK` constraint on each side.
 
-Also absent, and worth naming because they are the natural next questions:
+### A note on the provider
 
-- **Dead-letter topics and retry infrastructure.** An unusable message is skipped and
-  lost beyond its log line. A storage outage stops consumption rather than retrying.
-- **Lifecycle transitions.** The statuses beyond `PENDING` exist in the schema but
-  nothing moves an investigation into them, and no transition rules are enforced yet.
-- **Atomic database and Kafka commits.** They are separate transactions; idempotency
-  covers the gap rather than closing it.
+⚠️ The Anthropic adapter has been verified structurally against the installed SDK with
+constructed response objects, but **not against a live API** — no credentials were
+available. Treat the first real call as a verification step for latency, auth and
+rate-limit behaviour rather than for shape.
 
-No dependency for any of these is installed. They arrive in later sub-phases.
+Every test runs against a scripted `FakeModel`. None calls a provider, and none requires
+an API key.

@@ -21,20 +21,17 @@ ReconciliationException
     v
 Investigation
     |
-    +------> InvestigationEvidence
-    |
     v
 Recommendation
     |
-    v
-Approval
-
-PolicyDocument
+    +------> RecommendationEvidence
     |
     v
-PolicyChunk
+Review (human decision)
 
-All major operations
+Policy corpus (Markdown on disk)
+
+All investigation lifecycle events
     |
     v
 AuditEvent
@@ -73,11 +70,14 @@ Important domain objects also expose readable business identifiers.
 Examples:
 
 ```text
-TX-48291
-SET-8821
-EX-1042
-INV-2041
-REC-3011
+TX-48291     transaction        (Financial Core)
+SET-8821     settlement         (Financial Core)
+EX-1042      exception          (Financial Core)
+FR-14        fee rule           (Financial Core)
+INV-2041     investigation      (Investigation Service)
+REC-3011     recommendation     (Investigation Service)
+REV-7001     review             (Investigation Service)
+AUD-9001     audit event        (Investigation Service)
 ```
 
 These identifiers are useful in:
@@ -454,63 +454,17 @@ rather than discovered.
 
 ---
 
-# 7. InvestigationEvidence
+# 7. InvestigationEvidence — superseded
 
-## Purpose
+**Not implemented.** Superseded by section 10, `RecommendationEvidence`.
 
-Stores evidence collected by the investigation agent.
+Evidence is only ever retrieved in the course of producing one recommendation,
+and only evidence that passed grounding validation is persisted at all, so a
+separate evidence table joined to recommendations had no second side to its
+many-to-many relationship. The two tables would have held the same rows.
 
-Evidence allows recommendations to be traced back to authoritative sources.
-
-## Table
-
-```text
-investigation_evidence
-```
-
-## Fields
-
-| Field | Type | Required | Description |
-|---|---|---:|---|
-| id | UUID | Yes | Internal primary key |
-| evidence_id | VARCHAR(50) | Yes | Unique business ID |
-| investigation_id | VARCHAR(50) | Yes | Related investigation |
-| source_type | VARCHAR(50) | Yes | Type of evidence |
-| source_reference | VARCHAR(255) | Yes | Source business identifier |
-| summary | TEXT | Yes | Human-readable evidence summary |
-| content | TEXT | No | Relevant retrieved content |
-| retrieval_score | NUMERIC(6,5) | No | Retrieval score if applicable |
-| tool_name | VARCHAR(100) | Yes | Tool that retrieved evidence |
-| retrieved_at | TIMESTAMPTZ | Yes | Retrieval time |
-
-## EvidenceSourceType
-
-```text
-TRANSACTION
-SETTLEMENT
-FEE_RULE
-HISTORICAL_TRANSACTION
-POLICY_DOCUMENT
-```
-
-Example:
-
-```text
-evidence_id:
-EVD-5001
-
-source_type:
-FEE_RULE
-
-source_reference:
-FR-14
-
-summary:
-Tier B cross-network settlements incur a $30 processing fee.
-
-tool_name:
-get_fee_rules
-```
+Retained as a numbered heading so the surrounding section numbers, which are
+referenced elsewhere, do not shift.
 
 ---
 
@@ -589,14 +543,17 @@ to return structured authoritative information without requiring the LLM to extr
 
 Represents the structured conclusion produced by an investigation.
 
-Recommendations are advisory.
+Recommendations are advisory. They do not modify authoritative financial
+records, and nothing in the system acts on one without a human decision.
 
-They do not modify authoritative financial records.
+At most one per investigation. A second would make "the AI's conclusion" an
+ambiguous phrase, so `UNIQUE(investigation_id)` settles it in the database
+rather than in application code that two concurrent runs could both pass.
 
 ## Table
 
 ```text
-recommendations
+investigation.recommendations
 ```
 
 ## Fields
@@ -604,19 +561,54 @@ recommendations
 | Field | Type | Required | Description |
 |---|---|---:|---|
 | id | UUID | Yes | Internal primary key |
-| recommendation_id | VARCHAR(50) | Yes | Unique business ID |
-| investigation_id | VARCHAR(50) | Yes | Related investigation |
+| recommendation_id | VARCHAR(50) | Yes | Unique business ID (`REC-`) |
+| investigation_id | VARCHAR(50) | Yes | Related investigation; **UNIQUE** |
 | classification | VARCHAR(50) | Yes | Proposed root cause |
 | root_cause | TEXT | Yes | Explanation |
-| confidence | NUMERIC(5,4) | Yes | Agent confidence |
+| confidence | NUMERIC(5,4) | Yes | Model self-reported confidence — see below |
 | recommended_action | TEXT | Yes | Proposed analyst action |
-| requires_human_approval | BOOLEAN | Yes | Must be true for V1 |
-| should_escalate | BOOLEAN | Yes | Whether manual escalation is recommended |
+| requires_human_approval | BOOLEAN | Yes | CHECK-constrained to true |
+| model_provider | VARCHAR(50) | No | Which provider produced this |
+| model_name | VARCHAR(100) | No | Which model produced this |
+| prompt_version | VARCHAR(50) | No | Which instructions produced this |
 | created_at | TIMESTAMPTZ | Yes | Creation time |
 
-## RootCauseClassification
+`should_escalate` from the earlier draft is absent, deliberately. Whether
+something is escalated is decided by the deterministic guardrail, not proposed
+by the model, and it is recorded as the investigation's status. A model-supplied
+boolean next to it would be a second, contradictable answer to a question the
+policy already owns.
 
-Initial values:
+### Confidence is not a probability
+
+`confidence` is the model's own self-report. It is **not calibrated**: 0.9 does
+not mean nine such conclusions in ten are correct. It is used only as an
+ordering signal compared against an operator-configured threshold, and every API
+response carrying it says so. Nothing should present it as a statistical claim.
+
+It is `NUMERIC(5,4)` and never a float, so a stored confidence reads back as
+what was written and a threshold comparison cannot turn on binary rounding.
+
+### Database-enforced invariants
+
+```text
+CHECK requires_human_approval = true
+CHECK confidence BETWEEN 0 AND 1
+CHECK classification IN (the seven RootCauseClassification values)
+UNIQUE (investigation_id)
+```
+
+The first is the one that matters most: a recommendation that did not require
+human approval would be an autonomous decision, and the database refuses to
+store one even if every layer of application code were wrong.
+
+### What is deliberately not stored
+
+The prompt, the provider's raw request or response, and anything resembling
+model reasoning. Only the structured result a reviewer needs, plus enough
+operational metadata to know what produced it.
+
+## RootCauseClassification
 
 ```text
 PROCESSOR_FEE
@@ -628,7 +620,10 @@ UNKNOWN
 INSUFFICIENT_EVIDENCE
 ```
 
-This enum is intentionally different from `ExceptionType`.
+This enum is intentionally different from `ExceptionType`, and both differences
+are enforced by database CHECK constraints in their respective schemas:
+`PROCESSOR_FEE` can never be a detected exception type, and `AMOUNT_MISMATCH`
+can never be a root-cause classification.
 
 For example:
 
@@ -644,55 +639,33 @@ RootCauseClassification:
 PROCESSOR_FEE
 ```
 
+`INSUFFICIENT_EVIDENCE` is a first-class successful outcome, not a failure. An
+investigation reporting that the evidence does not support a conclusion has done
+its job; it is escalated to a human rather than recorded as having failed.
+
 ---
 
 # 10. RecommendationEvidence
 
 ## Purpose
 
-Creates an explicit many-to-many relationship between recommendations and the evidence supporting them.
+Records exactly which evidence items support a recommendation.
 
-This is important because a recommendation should not merely contain prose claiming that evidence exists.
+This matters because a recommendation must not merely contain prose claiming
+that evidence exists. "According to the fee schedule" cannot be checked;
+`FEE_RULE / FR-14` can be, and is.
 
-The database should record exactly which evidence items support the recommendation.
-
-## Table
-
-```text
-recommendation_evidence
-```
-
-## Fields
-
-| Field | Type | Required |
-|---|---|---:|
-| recommendation_id | UUID | Yes |
-| evidence_id | UUID | Yes |
-
-Composite primary key:
-
-```text
-(recommendation_id, evidence_id)
-```
-
-## Relationship
-
-```text
-Recommendation * ---- * InvestigationEvidence
-```
-
----
-
-# 11. Approval
-
-## Purpose
-
-Represents the human decision applied to an AI-generated recommendation.
+**Only references that passed grounding validation are stored here.** During an
+investigation the application keeps an in-memory ledger of what the tools
+actually returned, and every citation in a proposed result is checked against
+it. A result citing anything unverifiable is rejected in full — no conclusion is
+stored with the bad citation dropped. So the question "what evidence did the AI
+actually use?" has an answer that can be trusted later.
 
 ## Table
 
 ```text
-approvals
+investigation.recommendation_evidence
 ```
 
 ## Fields
@@ -700,15 +673,73 @@ approvals
 | Field | Type | Required | Description |
 |---|---|---:|---|
 | id | UUID | Yes | Internal primary key |
-| approval_id | VARCHAR(50) | Yes | Unique business ID |
-| recommendation_id | VARCHAR(50) | Yes | Recommendation being reviewed |
-| decision | VARCHAR(30) | Yes | Human decision |
-| reviewer_id | VARCHAR(100) | Yes | Analyst/user identifier |
-| reviewer_comment | TEXT | No | Optional explanation |
-| decided_at | TIMESTAMPTZ | Yes | Decision timestamp |
-| created_at | TIMESTAMPTZ | Yes | Record creation time |
+| recommendation_id | VARCHAR(50) | Yes | Recommendation this supports (FK) |
+| source_type | VARCHAR(50) | Yes | `TRANSACTION`, `SETTLEMENT`, `FEE_RULE`, `POLICY_DOCUMENT` |
+| reference | VARCHAR(255) | Yes | Business identifier of the cited record |
+| section | VARCHAR(255) | No | Which section, for policy evidence |
+| excerpt | TEXT | No | The retrieved text, for policy evidence |
+| created_at | TIMESTAMPTZ | Yes | Creation time |
 
-## ApprovalDecision
+`excerpt` is stored only for policy evidence, so a reviewer reads the words the
+investigation actually saw rather than whatever the corpus says by the time they
+look. Financial records are cited by identifier and re-read from the Financial
+Core, which remains their source of truth — copying their values here would
+create a second one that silently goes stale.
+
+`recommendation_id` is a real foreign key: both tables belong to this service,
+and evidence without its recommendation is meaningless. It is the only foreign
+key in the schema, and it points inward. There are none across the service
+boundary in either direction.
+
+## Consolidation from the earlier draft
+
+The earlier draft modelled this as two tables — `investigation_evidence` holding
+evidence, and a `recommendation_evidence` join table linking it to
+recommendations. As implemented there is one table.
+
+Evidence is only ever retrieved in the course of producing one recommendation,
+and only grounded evidence is persisted at all, so the many-to-many relationship
+had no second side. Two tables would have held the same rows with a distinction
+nothing consumed. Section 7 (`InvestigationEvidence`) is superseded by this one.
+
+---
+
+# 11. Review (implemented; formerly "Approval")
+
+## Purpose
+
+Represents the human decision applied to an AI-generated recommendation.
+
+Named `reviews` rather than `approvals` because a review records whichever
+decision was made. Naming the table after one outcome made rejection read like
+an exception to the normal path, when it is an equally normal path.
+
+## Table
+
+```text
+investigation.reviews
+```
+
+Owned by the Python Investigation Service. See section 23.
+
+## Fields
+
+| Field | Type | Required | Description |
+|---|---|---:|---|
+| id | UUID | Yes | Internal primary key |
+| review_id | VARCHAR(50) | Yes | Unique business ID (`REV-`) |
+| investigation_id | VARCHAR(50) | Yes | Investigation being decided; UNIQUE |
+| recommendation_id | VARCHAR(50) | Yes | Recommendation being reviewed (FK) |
+| decision | VARCHAR(30) | Yes | Human decision |
+| reviewed_by | VARCHAR(255) | Yes | Caller-supplied reviewer name — see below |
+| comment | TEXT | No | Optional explanation |
+| decided_at | TIMESTAMPTZ | Yes | Decision timestamp |
+
+`UNIQUE(investigation_id)` is the important one: a decision that can be
+overwritten is not a decision, and two reviewers submitting at once must not
+both be recorded. The constraint, not application code, is what makes that true.
+
+## ReviewDecision
 
 ```text
 APPROVED
@@ -716,11 +747,32 @@ REJECTED
 ESCALATED
 ```
 
-## Important Invariant
+There is deliberately no value meaning "approved without a human". The database
+CHECK constraint enforces the set.
 
-An AI agent must never create an approval decision.
+## Resulting investigation status
 
-Approval endpoints represent human actions.
+| Decision | Investigation becomes | Why |
+|---|---|---|
+| APPROVED | COMPLETED | A human accepted the explanation. |
+| REJECTED | ESCALATED | The explanation was not accepted, but the discrepancy still exists and still needs a human. |
+| ESCALATED | ESCALATED | The reviewer declined to decide and passed it on. |
+
+## Important invariants
+
+An AI agent must never create a review. Reviews are created only by the human
+review endpoints.
+
+**Approval does not act.** Recording an approval writes to this service's own
+tables and makes no call to the Financial Core — no POST, PUT, PATCH or DELETE.
+No exception is resolved, no settlement is altered, and no money moves. Acting
+on an approved recommendation is a separate, deliberate step outside this
+service.
+
+**`reviewed_by` is not an identity.** V1 has no authentication. The value is
+whatever the caller sent, recorded verbatim as the claim it is. Every API
+response carrying it says so. Do not build anything on it that assumes
+otherwise.
 
 ---
 
@@ -815,70 +867,98 @@ Chunk 18
 
 Records significant system actions so an investigation can be reconstructed.
 
-Audit records should be append-only from the application's perspective.
+Append-only. There is no update path and no delete path — not in the service,
+not in the API. A trail that can be revised is not evidence of anything.
 
 ## Table
 
 ```text
-audit_events
+investigation.audit_events
 ```
+
+Owned by the Python Investigation Service. See section 23 for why the AI
+lifecycle trail lives here rather than in the Financial Core.
 
 ## Fields
 
 | Field | Type | Required | Description |
 |---|---|---:|---|
 | id | UUID | Yes | Internal primary key |
-| event_id | VARCHAR(50) | Yes | Unique business ID |
+| event_id | VARCHAR(50) | Yes | Unique business ID (`AUD-`) |
+| sequence_no | BIGINT | Yes | Sequence value behind `event_id`; UNIQUE |
+| investigation_id | VARCHAR(50) | Yes | Investigation this event belongs to |
 | event_type | VARCHAR(50) | Yes | Audit event classification |
 | actor_type | VARCHAR(30) | Yes | Source of action |
-| actor_id | VARCHAR(100) | No | Specific actor |
-| resource_type | VARCHAR(50) | Yes | Affected resource type |
-| resource_id | VARCHAR(100) | Yes | Affected resource |
-| correlation_id | VARCHAR(100) | No | Cross-service correlation identifier |
-| metadata | JSONB | No | Additional structured information |
-| occurred_at | TIMESTAMPTZ | Yes | Event timestamp |
+| actor_id | VARCHAR(255) | No | Specific actor; set only for HUMAN events |
+| metadata | JSONB | No | Small non-sensitive summary |
+| occurred_at | TIMESTAMPTZ | Yes | Event timestamp (`clock_timestamp()`) |
+
+`sequence_no` exists because the trail needs a **total** order and neither
+alternative provides one: several events are committed in a single transaction,
+and ordering by `event_id` as text would sort `AUD-10001` before `AUD-9001`.
+`occurred_at` uses `clock_timestamp()` rather than `now()` so it records when
+the event happened rather than when its transaction began.
+
+`resource_type` / `resource_id` / `correlation_id` from the earlier draft are
+absent. Every event in this table is about exactly one investigation, so a
+generic resource reference would only ever hold the same value that
+`investigation_id` already holds.
+
+## What metadata may contain
+
+A classification, a confidence, an evidence count, a guardrail reason, a failure
+category, the threshold that was applied. Enough to re-derive why something was
+routed the way it was.
+
+**Never** a prompt, a provider request or response, a credential, or anything
+resembling model reasoning. This table is read by humans reviewing decisions; it
+is not a debugging sink, and private chain-of-thought is neither requested,
+persisted, nor exposed anywhere in the system.
 
 ## ActorType
 
 ```text
-SYSTEM
-AGENT
-USER
+SYSTEM    application logic: lifecycle transitions and guardrail routing
+AI        the model produced a result
+HUMAN     a person decided
 ```
 
 ## AuditEventType
 
-Initial values:
+Implemented values, all of them investigation-lifecycle events:
 
 ```text
-TRANSACTION_CREATED
-
-SETTLEMENT_CREATED
-
-RECONCILIATION_STARTED
-
-RECONCILIATION_COMPLETED
-
-EXCEPTION_DETECTED
-
-EXCEPTION_PUBLISHED
+INVESTIGATION_CREATED
 
 INVESTIGATION_STARTED
 
-TOOL_CALLED
+AI_RESULT_GENERATED
 
-EVIDENCE_RETRIEVED
-
-RECOMMENDATION_GENERATED
-
-INVESTIGATION_FAILED
+INVESTIGATION_AWAITING_REVIEW
 
 INVESTIGATION_ESCALATED
 
-RECOMMENDATION_APPROVED
+INVESTIGATION_FAILED
 
-RECOMMENDATION_REJECTED
+REVIEW_APPROVED
+
+REVIEW_REJECTED
 ```
+
+Deliberately few. `TOOL_CALLED` and `EVIDENCE_RETRIEVED` from the earlier draft
+are absent: a durable row per tool call would bury the events a reviewer
+actually needs, and what the tools returned is already recorded, verified, as
+`recommendation_evidence`. Tool activity is logged, not audited.
+
+The `TRANSACTION_*`, `SETTLEMENT_*` and `RECONCILIATION_*` values are also
+absent. Those are Financial Core state changes; this service does not observe
+them and must not claim to have recorded them.
+
+## Transactional guarantee
+
+Each event is written in the same transaction as the state change it describes.
+An audit entry that survived a rolled-back transition would be a record of
+something that never happened.
 
 ---
 
@@ -887,6 +967,8 @@ RECOMMENDATION_REJECTED
 The primary domain relationships are:
 
 ```text
+=========== Financial Core (schema: public) ===========
+
 Transaction
     |
     | 1
@@ -903,20 +985,15 @@ Transaction
     | 0..*
     v
 ReconciliationException
-    |
-    | 1
-    |
+
+======== no foreign keys cross this line ==============
+
+========= Investigation Service (investigation) ========
+
+ReconciliationException.exception_id
+    |                       (a string reference, not a FK)
     | 0..1
     v
-Investigation
-    |
-    | 1
-    |
-    | 0..*
-    v
-InvestigationEvidence
-
-
 Investigation
     |
     | 1
@@ -924,32 +1001,41 @@ Investigation
     | 0..1
     v
 Recommendation
-    |
-    | 1
-    |
-    | 0..1
-    v
-Approval
+    |                       \
+    | 1                      \ 1
+    |                         \
+    | 0..*                     \ 0..1
+    v                           v
+RecommendationEvidence        Review
 
 
-Recommendation
-      *
-      |
-      |
-      *
-InvestigationEvidence
-
-
-PolicyDocument
-    |
-    | 1
-    |
-    | *
-    v
-PolicyChunk
+AuditEvent  --> Investigation  (by investigation_id; append-only)
 ```
 
-`AuditEvent` references resources generically rather than requiring a foreign key to every domain table.
+## The boundary
+
+Nothing in the `investigation` schema holds a foreign key into `public`, and
+nothing in `public` holds one into `investigation`. The Investigation Service
+stores Financial Core business identifiers as plain string columns and resolves
+them through the Financial Core's read-only API when it needs the records.
+
+This is deliberate. A foreign key would couple one service's writes to another
+service's schema and make the ownership boundary decorative. The only foreign
+keys in the `investigation` schema point at `recommendations`, which the same
+service owns.
+
+## Cardinality notes
+
+`Investigation` is 0..1 per exception, not 0..*. Reprocessing an exception
+continues the existing case rather than opening another; see section 6.
+
+`Recommendation` is 0..1 per investigation and `Review` is 0..1 per
+investigation. Both are enforced by unique constraints, because both are
+questions that must have exactly one answer.
+
+`AuditEvent` is many-per-investigation, ordered by `sequence_no`, and references
+its investigation by business identifier rather than generically — every event
+in the table is about exactly one investigation.
 
 ---
 
@@ -1030,26 +1116,30 @@ The investigation produces:
   "rootCause": "A $30 processor settlement fee was applied.",
   "confidence": 0.94,
   "recommendedAction": "Classify the discrepancy as a processor fee adjustment.",
-  "requiresHumanApproval": true,
-  "shouldEscalate": false
+  "requiresHumanApproval": true
 }
 ```
 
-The recommendation is linked to evidence:
+The recommendation is linked to the evidence it was validated against. Each row
+is a reference the application confirmed a tool really returned:
 
 ```text
 REC-3011
    |
-   +---- EVD-5001 → Fee Rule FR-14
+   +---- FEE_RULE / FR-14
    |
-   +---- EVD-5002 → Settlement Policy §4.2
+   +---- POLICY_DOCUMENT / POL-SETTLEMENT-001 §4.2
    |
-   +---- EVD-5003 → Historical Transaction TX-38182
+   +---- SETTLEMENT / SET-8821
 ```
+
+A citation that could not be traced to a retrieval would have caused the whole
+result to be rejected, so nothing in this list is a claim about something
+nobody read.
 
 ---
 
-# 18. Example Approval
+# 18. Example Review
 
 The analyst reviews the recommendation and selects:
 
@@ -1057,31 +1147,37 @@ The analyst reviews the recommendation and selects:
 APPROVED
 ```
 
-An Approval record is created:
+A Review record is created:
 
 ```json
 {
-  "approvalId": "APR-9011",
+  "reviewId": "REV-7001",
+  "investigationId": "INV-2041",
   "recommendationId": "REC-3011",
   "decision": "APPROVED",
-  "reviewerId": "analyst-01",
-  "reviewerComment": "Fee configuration and historical settlements support the recommendation."
+  "reviewedBy": "analyst-01",
+  "comment": "Fee configuration and settlement policy support the recommendation.",
+  "decidedAt": "2026-09-27T12:04:00Z"
 }
 ```
 
-An audit event is then recorded:
+The investigation becomes `COMPLETED`, and an audit event records that a human
+made the decision.
 
-```text
-RECOMMENDATION_APPROVED
-```
+## What approval does not do
 
-The reconciliation exception may transition:
+Approval records a human judgement about an explanation. It does not:
 
-```text
-AWAITING_REVIEW
-        ↓
-RESOLVED
-```
+- resolve the reconciliation exception;
+- modify any transaction or settlement;
+- move money; or
+- issue any write of any kind to the Financial Core.
+
+The Investigation Service has no write path to the Financial Core — the review
+service holds no client to it at all. Acting on an approved recommendation is a
+separate, deliberate step outside this service.
+
+`reviewedBy` is caller-supplied and unverified. V1 has no authentication.
 
 ---
 
@@ -1116,18 +1212,72 @@ It may return to manual investigation.
 ```text
 PENDING
    |
+   |  run: claimed by a conditional UPDATE
    v
 RUNNING
    |
-   +-------------+
-   |             |
-   v             v
-COMPLETED      FAILED
+   +---------------------------+---------------------+
+   |                           |                     |
+   |  guardrail: confident     |  guardrail:         |  execution
+   |  and grounded             |  anything weaker    |  failure
+   v                           v                     v
+AWAITING_REVIEW            ESCALATED              FAILED
    |
-   v
-ESCALATED
-(if insufficient evidence)
+   +-------------+----------------+
+   |             |                |
+   | approved    | rejected       | escalated
+   v             v                v
+COMPLETED    ESCALATED        ESCALATED
 ```
+
+Every transition is made by application code. The model proposes an explanation
+and never decides what state the workflow is in.
+
+**Only a human reaches COMPLETED.** No confidence value is a shortcut: the
+deterministic guardrail has exactly two outcomes, `AWAITING_REVIEW` and
+`ESCALATED`, and neither completes anything.
+
+`RUNNING` is claimed with `UPDATE ... WHERE status = 'PENDING' RETURNING`, so
+concurrent run requests are resolved by the database rather than by a
+read-then-write that both would pass. A losing request is refused before any
+model call is made.
+
+A crash between claiming and recording leaves an investigation in `RUNNING`.
+That is deliberate: the work was started and its outcome is unknown, which is an
+honest state. There is no background scheduler and no distributed lock to
+quietly undo it; recovering is an operational decision.
+
+`ESCALATED` is reached three ways — by the guardrail, by rejection, or by a
+reviewer explicitly passing it on — and is terminal in this service. Rejection
+escalates rather than resolving because a rejected explanation does not make the
+underlying discrepancy go away.
+
+---
+
+## Transaction boundaries
+
+A model call is slow, external, and cannot participate in a database
+transaction. The run path is therefore three short transactions with the call
+between them, and nothing is held open while it runs:
+
+```text
+TX1   claim PENDING -> RUNNING, audit INVESTIGATION_STARTED        commit
+      |
+      |   (no transaction open)
+      v
+      agent: bounded tool loop, model call, grounding validation
+      |
+      v
+TX2   recommendation + evidence + guardrail status + audit         commit
+```
+
+On failure, a third transaction records `FAILED` and the reason.
+
+Database and model are not atomic together, and nothing here pretends
+otherwise. What *is* atomic is TX2: the recommendation, its evidence, the
+resulting status and the audit events commit together, because a recommendation
+with no status change is invisible and a status change with no recommendation is
+unexplainable.
 
 ---
 
@@ -1147,11 +1297,40 @@ It must not contain speculative AI conclusions.
 
 ### Evidence Traceability
 
-Recommendations should reference the evidence used to support them.
+Recommendations must reference the evidence used to support them, and every
+reference must be verified against what the tools actually returned before the
+result is accepted. A result citing anything unverifiable is rejected in full;
+no conclusion is stored with the bad citation removed.
 
 ### Human Approval
 
-`Approval` records must originate from human-facing application actions, not agent tools.
+`Review` records must originate from human-facing application actions, not agent
+tools. No agent tool can create one, and no code path reachable from a model can.
+
+Approval is a judgement, not an action: recording one writes only to the
+Investigation Service's own tables and issues no request to the Financial Core.
+
+`reviewed_by` is caller-supplied and unauthenticated in V1. It records a claim,
+not a verified identity, and every response carrying it says so.
+
+### Deterministic Guardrails
+
+Routing between human review and escalation is decided by application code from
+the stored result, never by the model. The same result must always route the
+same way, and the reason must be stored alongside it so the decision can be
+re-derived later.
+
+### Confidence Is Not Calibrated
+
+`Recommendation.confidence` is a model self-report used only as an ordering
+signal against a configured threshold. It must never be presented as a
+probability.
+
+### No Persisted Reasoning
+
+Private chain-of-thought is never requested, persisted, or exposed. Stored
+artifacts hold the structured result and operational metadata only — never a
+prompt, a provider payload, or model reasoning.
 
 ### Read-Only Agent Access
 
@@ -1183,7 +1362,7 @@ Policy evidence should retain document version and section information.
 
 # 21. Recommended V1 Indexes
 
-The following indexes should be created initially:
+## Financial Core (schema: public)
 
 ```text
 transactions(transaction_id)
@@ -1200,32 +1379,49 @@ reconciliation_exceptions(transaction_id)
 
 reconciliation_exceptions(status)
 
-investigations(investigation_id)
-
-investigations(exception_id)
-
-investigation_evidence(investigation_id)
-
 fee_rules(merchant_id)
-
-recommendations(investigation_id)
-
-approvals(recommendation_id)
-
-policy_documents(document_id)
-
-policy_chunks(document_id)
-
-audit_events(resource_id)
-
-audit_events(correlation_id)
-
-audit_events(occurred_at)
 ```
 
-A vector index for `policy_chunks.embedding` may be introduced once the RAG implementation is established.
+## Investigation Service (schema: investigation)
 
-For the small V1 corpus, correctness and simplicity take priority over vector-index optimization.
+```text
+investigations(investigation_id)        unique constraint
+
+investigations(exception_id)            unique constraint — the idempotency guarantee
+
+investigations(status)
+
+investigations(transaction_id)
+
+recommendations(recommendation_id)      unique constraint
+
+recommendations(investigation_id)       unique constraint — one conclusion per investigation
+
+recommendation_evidence(recommendation_id)
+
+reviews(review_id)                      unique constraint
+
+reviews(investigation_id)               unique constraint — one decision per investigation
+
+audit_events(event_id)                  unique constraint
+
+audit_events(sequence_no)               unique constraint
+
+audit_events(investigation_id, sequence_no)
+```
+
+Several of these are unique constraints rather than plain indexes, and that is
+the point: each one is a correctness guarantee that concurrent requests would
+otherwise be able to violate, and it happens to index the column as a side
+effect.
+
+The composite `(investigation_id, sequence_no)` serves the only way the trail is
+read — one investigation's timeline, in order.
+
+No index on `policy_chunks`: the policy corpus is Markdown on disk in V1, with
+no embeddings and no vector database. For a corpus this size, lexical search is
+correct, explainable and fast enough, and an unexplainable retrieval step would
+undercut the evidence guarantees the rest of the system rests on.
 
 ---
 
@@ -1272,34 +1468,67 @@ This prevents the demonstration dataset from being designed exclusively around c
 The system should maintain clear ownership boundaries.
 
 ```text
-Spring Boot Financial Core owns:
+Spring Boot Financial Core owns (schema: public):
 
 transactions
 settlements
 reconciliation_exceptions
 fee_rules
-approvals
+```
+
+```text
+Python Investigation Service owns (schema: investigation):
+
+investigations
+recommendations
+recommendation_evidence
+reviews
 audit_events
 ```
 
-The investigation layer is responsible for producing:
+Policy knowledge is not a database concern in V1: the corpus is a directory of
+Markdown documents on disk, searched lexically. See `policies/README.md`.
 
-```text
-investigations
-investigation_evidence
-recommendations
-```
+For V1, both schemas reside within the same PostgreSQL instance.
 
-Policy ingestion manages:
+Shared physical storage does not imply shared application ownership. The
+separate schema is what makes the boundary enforceable rather than conventional,
+and there are no foreign keys across it in either direction.
 
-```text
-policy_documents
-policy_chunks
-```
+## Why human review and audit moved to the Investigation Service
 
-For V1, these entities may reside within the same PostgreSQL instance.
+An earlier draft of this section assigned `approvals` and `audit_events` to the
+Financial Core. As implemented they belong to the Investigation Service, for two
+reasons:
 
-Shared physical storage does not imply shared application ownership.
+1. **What is being reviewed is an AI recommendation, not a financial record.** A
+   review decides whether an explanation is acceptable. It does not resolve an
+   exception, settle anything, or move money — no approval path in this system
+   writes to the Financial Core. Storing that decision next to the
+   recommendation it judges keeps the two from drifting apart, and lets a single
+   unique constraint guarantee one decision per investigation.
+
+2. **The audit trail being recorded is the AI lifecycle.** Its events are
+   "investigation started", "result generated", "escalated by policy",
+   "approved by a human" — all of which happen in the Investigation Service and
+   none of which the Financial Core observes. Writing them from the service that
+   causes them is what lets each event commit in the same transaction as the
+   state change it describes.
+
+If the Financial Core later needs its own audit trail for its own state changes,
+that is a separate table owned by it, recording different events. The two are
+not the same concept and should not be merged.
+
+## Terminology
+
+The implemented table is `reviews`, not `approvals`. A review records whichever
+decision a human made — approved, rejected, or escalated — and naming the table
+after only one of those outcomes made rejection look like an afterthought.
+
+`recommendation_evidence` replaces the earlier pair of `investigation_evidence`
+and `recommendation_evidence`. Evidence is only ever retrieved in the course of
+producing one recommendation, so two tables would have held the same rows with a
+distinction nothing consumed.
 
 The agent should still access financial-domain information through controlled APIs/tools rather than direct unrestricted SQL access.
 
@@ -1315,27 +1544,32 @@ Financial Fact
      v
 Transaction + Settlement
      |
-     v
+     v                          deterministic: rule precedence, BigDecimal
 Deterministic Discrepancy
      |
      v
 ReconciliationException
      |
-     v
+     v                          published on Kafka after commit
 AI Investigation
      |
-     v
+     v                          bounded tool loop; only allowlisted reads
 Retrieved Evidence
      |
-     v
+     v                          every citation verified against what was retrieved
 Recommendation
      |
-     v
+     v                          deterministic guardrail: review or escalate
 Human Decision
      |
-     v
+     v                          append-only, one transaction per state change
 Audit Trail
 ```
+
+Each arrow narrows what the next stage is allowed to assert. The deterministic
+engine decides *that* something is wrong; the investigation may only cite
+evidence it actually retrieved; the guardrail — not the model — decides what a
+human sees; and only a human completes anything.
 
 This separation allows ReconAI to use probabilistic AI capabilities without making probabilistic outputs authoritative financial facts.
 

@@ -376,6 +376,16 @@ The agent does not receive unrestricted access to application databases.
 
 Instead, it interacts with the system through explicitly defined tools.
 
+The service owns the `investigation` schema and everything the AI lifecycle produces:
+the investigation case, the recommendation, the evidence behind it, the human review
+decision, and the audit trail. It owns no financial records, reads them only through the
+Financial Core's read-only API, and **issues no write to the Financial Core of any
+kind**.
+
+It is also where the deterministic guardrail lives — the policy deciding whether a
+result reaches a human or is escalated. That decision is made by application code from
+the stored result, never by the model.
+
 ---
 
 ## 7. Agent Tools
@@ -521,13 +531,16 @@ A typical investigation proceeds as follows:
 AMOUNT_MISMATCH
         |
         v
-Investigation Created
+Investigation Created (PENDING, from the Kafka event)
+        |
+        v
+Claimed: PENDING -> RUNNING          [transaction 1, committed]
         |
         v
 get_transaction()
         |
-        v
-get_settlement()
+        v                             no transaction is open here
+get_settlements()
         |
         v
 Difference confirmed
@@ -539,68 +552,131 @@ get_fee_rules()
 Potential matching fee found
         |
         v
-search_policy_documents()
+search_policies()
         |
         v
 Applicable policy retrieved
         |
         v
-get_transaction_history()
-        |
-        v
-Historical behavior examined
-        |
-        v
 Evidence evaluated
         |
         v
-Structured Recommendation
+Structured result proposed
+        |
+        v
+Grounding validation: every citation checked against
+what the tools actually returned
+        |
+        v
+Deterministic guardrail: AWAITING_REVIEW or ESCALATED
+        |
+        v
+Recommendation + evidence + status + audit    [transaction 2, committed]
+        |
+        v
+Human decision                                [transaction 3, committed]
 ```
 
-Different exception types may produce different tool-call sequences.
+Different exception types produce different tool-call sequences. This is one
+reason investigation is modeled as an agentic workflow rather than a single
+fixed prompt.
 
-This is one reason investigation is modeled as an agentic workflow rather than a single fixed prompt.
+### The loop is bounded
+
+An agent that can call tools indefinitely is an agent that can spend
+indefinitely. The number of tool rounds is capped
+(`RECONAI_AGENT_INVESTIGATION_MAX_TOOL_ROUNDS`, default 8), and a model that
+cannot reach a conclusion within the bound fails visibly rather than circling.
+
+### Why three transactions rather than one
+
+A model call is slow, external, and cannot participate in a database
+transaction. Wrapping the whole workflow in one would mean holding a row lock
+open across a network call to a third party — so the database work is split
+around the call instead, and nothing is held open while it runs.
+
+The database and the model are not atomic together, and nothing in the design
+pretends otherwise. What *is* atomic is the recording step: the recommendation,
+its evidence, the resulting status and the audit events commit together, because
+a recommendation with no status change is invisible and a status change with no
+recommendation is unexplainable.
+
+A crash between claiming and recording leaves the investigation in `RUNNING` —
+a visible, honest state meaning "started, outcome unknown". There is no
+background scheduler and no distributed lock to quietly resolve it.
+
+### Concurrency
+
+Claiming is a conditional `UPDATE ... WHERE status = 'PENDING' RETURNING`. Two
+simultaneous run requests both pass any read-based check, but only one can win
+the update, because the database serialises the row. The loser is refused with
+`409` **before** a model call is made, so a rejected run costs nothing.
 
 ---
 
 ## 10. Investigation Output
 
-The agent must return structured output.
+The agent must return structured output. Free-form prose may be included for
+analyst readability, but no application behaviour depends on it.
 
 Example:
 
 ```json
 {
   "classification": "PROCESSOR_FEE",
-  "rootCause": "A $30 processor settlement fee was applied.",
-  "confidence": 0.94,
+  "rootCause": "An active 50.00 USD processing fee is consistent with the difference.",
+  "confidence": 0.86,
   "evidence": [
-    {
-      "sourceType": "FEE_RULE",
-      "reference": "FR-14"
-    },
-    {
-      "sourceType": "POLICY",
-      "reference": "Settlement Processing Policy §4.2"
-    },
-    {
-      "sourceType": "HISTORICAL_TRANSACTION",
-      "reference": "TX-38182"
-    }
+    {"sourceType": "FEE_RULE", "reference": "FR-14"},
+    {"sourceType": "SETTLEMENT", "reference": "SET-8008"},
+    {"sourceType": "POLICY_DOCUMENT", "reference": "POL-FEE-001",
+     "section": "Cross-Network Settlement Fees"}
   ],
   "recommendedAction": "Classify the discrepancy as a processor fee adjustment.",
-  "requiresHumanApproval": true,
-  "shouldEscalate": false
+  "requiresHumanApproval": true
 }
 ```
 
-Free-form text may be included for analyst readability, but application behavior should rely on structured fields.
+### Evidence is verified, not trusted
+
+A model asked for its sources will produce plausible ones whether or not it saw
+them — `FR-999` looks exactly like `FR-14`. So the application keeps its own
+ledger of what the tools actually returned during the run, and checks every
+citation against it.
+
+A result citing anything unverifiable is **rejected in full**. Not downgraded,
+not stored with the bad citation removed: an investigation that fabricated one
+reference has not demonstrated that it did not fabricate the reasoning. The
+investigation moves to `FAILED` and no recommendation is stored.
+
+`sourceType` is one of `TRANSACTION`, `SETTLEMENT`, `FEE_RULE`,
+`POLICY_DOCUMENT` — one per controlled tool. `HISTORICAL_TRANSACTION` from the
+earlier draft is absent because no tool retrieves it; a source with no tool
+behind it could only ever be cited from imagination.
+
+### `shouldEscalate` is not a model output
+
+Whether something is escalated is decided by the deterministic guardrail from
+the stored result, and recorded as the investigation's status. A model-supplied
+boolean would be a second, contradictable answer to a question the policy owns.
+
+### `requiresHumanApproval` is always true
+
+Pinned by the result schema, and independently enforced by a database CHECK
+constraint. A result cannot describe itself as needing no review — not even a
+malformed one that slipped past a validator.
+
+### `confidence` is a self-report
+
+It is not a calibrated probability, and is used only as an ordering signal
+against a configured threshold. Every API response carrying it says so.
 
 ---
 
 ## 11. Human-in-the-Loop Control
 
-AI recommendations are advisory.
+AI recommendations are advisory. This is the boundary the whole system is built
+around, so it is worth being precise about what it does and does not mean.
 
 An investigation enters:
 
@@ -608,36 +684,73 @@ An investigation enters:
 AWAITING_REVIEW
 ```
 
-after the agent completes its work.
+when the agent has produced a grounded result that the deterministic guardrail
+judged fit for review. Anything weaker goes to `ESCALATED` instead.
 
-An authorized analyst can then select:
+An analyst can then select:
 
 ```text
-APPROVE
-
-REJECT
-
-ESCALATE
+APPROVE     the explanation is accepted; investigation -> COMPLETED
+REJECT      the explanation is not accepted; investigation -> ESCALATED
+ESCALATE    the reviewer passes it on; investigation -> ESCALATED
 ```
 
-The agent cannot perform these operations itself.
+The agent cannot perform these operations. Not as a tool, and not by any
+reachable code path.
+
+### What approval does
+
+It records that a human judged an explanation acceptable.
+
+### What approval does not do
+
+It does not resolve the reconciliation exception, alter a settlement, or move
+money. **The Investigation Service issues no write of any kind to the Financial
+Core** — the review service holds no client to it at all, so the boundary is
+structural rather than a rule to remember. Acting on an approved recommendation
+is a separate, deliberate step outside this service.
+
+### Rejection escalates rather than resolving
+
+A rejected recommendation does not make the underlying discrepancy disappear.
+The exception is still there and still needs a human; what was rejected is one
+proposed explanation of it.
+
+### Reviewer identity
+
+V1 has **no authentication**. `reviewed_by` is caller-supplied, stored verbatim,
+and returned with a note saying it is unverified. It is demo attribution, not
+identity.
+
+### One decision, once
+
+At most one decision per investigation, enforced by a unique constraint rather
+than an application check. Two reviewers submitting at once result in exactly
+one stored decision; a decision that could be silently overwritten would not be
+a decision.
 
 ### State Flow
 
 ```text
-OPEN
+PENDING
   |
   v
-INVESTIGATING
+RUNNING
   |
-  v
-AWAITING_REVIEW
+  +-------------------------+------------------+
+  |  guardrail: confident   |  guardrail:      |  execution
+  |  and grounded           |  anything weaker |  failure
+  v                         v                  v
+AWAITING_REVIEW         ESCALATED           FAILED
   |
-  +-------------------+
-  |         |         |
-  v         v         v
-APPROVED  REJECTED  ESCALATED
+  +------------+-------------+
+  | approve    | reject      | escalate
+  v            v             v
+COMPLETED   ESCALATED    ESCALATED
 ```
+
+**Only a human reaches COMPLETED.** No confidence value is a shortcut: the
+guardrail has exactly two outcomes and neither completes anything.
 
 ---
 
@@ -687,22 +800,57 @@ rather than an unsupported explanation.
 
 ### 12.4 Confidence-Based Escalation
 
-Initial V1 thresholds may be configured approximately as:
+Routing is decided by deterministic application code, never by the model. The
+same result always routes the same way, which is what makes an escalation
+explainable months later.
+
+Implemented policy:
 
 ```text
-confidence >= 0.85
-    recommendation available for review
+classification is INSUFFICIENT_EVIDENCE or UNKNOWN
+    -> ESCALATED   (checked first: the model has said it does not know,
+                    and no confidence number changes that)
 
-confidence >= 0.60 and < 0.85
-    recommendation + elevated review warning
+fewer verified evidence references than the minimum
+    -> ESCALATED   (a conclusion citing nothing verifiable needs a human
+                    however confident it sounds)
 
-confidence < 0.60
-    escalate / insufficient evidence
+confidence < threshold
+    -> ESCALATED
+
+otherwise
+    -> AWAITING_REVIEW
 ```
 
-These thresholds are configurable operational policies, not intrinsic measures of truth.
+Both parameters are configurable:
 
-Their effectiveness should be evaluated against the project's evaluation dataset.
+```text
+RECONAI_AGENT_REVIEW_CONFIDENCE_THRESHOLD   default 0.85
+RECONAI_AGENT_REVIEW_MINIMUM_EVIDENCE       default 1
+```
+
+The reason is stored with the outcome, quoting the threshold that was applied,
+so the decision can be re-derived from the record rather than reconstructed from
+the code as it stands later.
+
+The threshold is compared as an exact decimal, never a float, so a boundary case
+cannot turn on binary rounding — and the value compared is the same one that is
+stored, so the routing and the stored confidence can never disagree.
+
+The earlier draft's middle band ("confidence + elevated review warning") is not
+implemented. Every non-qualifying case converges on the same action — a human
+looks at it — so a third tier would have been a label without a behaviour.
+
+### Confidence is not truth
+
+These thresholds are configurable operational policies, not intrinsic measures
+of truth. The number being compared is the model's own self-report and is **not
+a calibrated probability**: 0.9 does not mean nine such conclusions in ten are
+correct. It is an ordering signal, and nothing in the system presents it as
+anything more.
+
+Their effectiveness should be evaluated against the project's evaluation
+dataset.
 
 ---
 
@@ -716,43 +864,77 @@ Unnecessary personally identifiable or sensitive financial information should be
 
 ## 13. Audit Architecture
 
-ReconAI records significant actions as audit events.
+ReconAI records significant actions as audit events, so an investigation can be
+reconstructed after the fact.
 
-Example events:
+The trail of the AI lifecycle is owned by the Investigation Service — the
+service that causes those events — and lives in the `investigation` schema. See
+`docs/data-model.md` section 23 for why it is not the Financial Core's.
+
+Implemented events:
 
 ```text
-EXCEPTION_DETECTED
-
-EXCEPTION_PUBLISHED
+INVESTIGATION_CREATED
 
 INVESTIGATION_STARTED
 
-TOOL_CALLED
+AI_RESULT_GENERATED
 
-EVIDENCE_RETRIEVED
-
-RECOMMENDATION_GENERATED
+INVESTIGATION_AWAITING_REVIEW
 
 INVESTIGATION_ESCALATED
 
-RECOMMENDATION_APPROVED
+INVESTIGATION_FAILED
 
-RECOMMENDATION_REJECTED
+REVIEW_APPROVED
+
+REVIEW_REJECTED
 ```
 
-An audit event should contain:
+An audit event contains:
 
 ```text
-event ID
-timestamp
-actor
+event ID (AUD-)
+sequence number
+investigation ID
 event type
-resource type
-resource ID
-relevant metadata
+actor type   SYSTEM | AI | HUMAN
+actor ID     set only for HUMAN events; unauthenticated
+metadata     small, non-sensitive summary
+occurred at
 ```
 
-The goal is to make an investigation reconstructable after the fact.
+### Append-only
+
+There is no update path and no delete path — not in the service, not in the API.
+Append-only is enforced by the absence of a write path rather than by a check
+that could be bypassed. A trail that can be revised is not evidence of anything.
+
+### Written in the same transaction as what it describes
+
+Each event is committed alongside the state change it records. An audit entry
+that survived a rolled-back transition would be a record of something that never
+happened.
+
+### Ordered by an integer sequence
+
+Not by timestamp, which ties when several events share a transaction, and not by
+identifier text, which would sort `AUD-10001` before `AUD-9001`.
+
+### Deliberately few events
+
+`TOOL_CALLED` and `EVIDENCE_RETRIEVED` from the earlier draft are not audited. A
+durable row per tool call would bury the events a reviewer actually needs, and
+what the tools returned is already recorded — verified — as recommendation
+evidence. Tool activity is logged, not audited. An audit trail nobody can read
+is not an audit trail.
+
+### What metadata never contains
+
+No prompt, no provider request or response, no credential, and nothing
+resembling model reasoning. Private chain-of-thought is never requested,
+persisted or exposed anywhere in this system. This table is read by humans
+reviewing decisions; it is not a debugging sink.
 
 ---
 
@@ -817,13 +999,17 @@ The V1 implementation may use simpler publishing semantics while explicitly docu
 
 ## 15. Data Architecture
 
-The initial relational model contains:
+Two schemas in one PostgreSQL instance, owned by two services. Shared physical
+storage is not shared application ownership, and the separate schema makes the
+boundary something the database enforces rather than something a reviewer takes
+on trust.
 
 ```text
+====== Financial Core — schema: public ======
+
 Transaction
      |
      | 1
-     |
      | *
 Settlement
 
@@ -831,44 +1017,55 @@ Settlement
 Transaction
      |
      | 1
-     |
      | *
 ReconciliationException
-     |
-     | 1
-     |
-     | *
+
+FeeRule
+
+========== no foreign keys cross ===========
+
+== Investigation Service — schema: investigation ==
+
+ReconciliationException.exception_id
+     |        (a string reference, not a foreign key)
+     | 0..1
 Investigation
      |
      | 1
-     |
-     | *
-InvestigationEvidence
-     |
-     | 1
-     |
      | 0..1
 Recommendation
-     |
-     | 1
-     |
-     | 0..1
-Approval
+     |                  \
+     | 1                 \ 1
+     | *                  \ 0..1
+RecommendationEvidence   Review
 
 
-PolicyDocument
-     |
-     | 1
-     |
-     | *
-PolicyChunk
+AuditEvent → one investigation, by business identifier; append-only
 
 
-AuditEvent
-→ references relevant domain resources
+Policy corpus: Markdown files on disk, not a table
 ```
 
-Detailed schemas will be defined separately from this architecture document.
+### The boundary
+
+Nothing in `investigation` holds a foreign key into `public`, and nothing in
+`public` holds one into `investigation`. The Investigation Service stores
+Financial Core business identifiers as plain string columns and resolves them
+through the read-only API when it needs the records.
+
+A foreign key would couple one service's writes to another service's schema and
+make the ownership boundary decorative. The only foreign keys in the
+`investigation` schema point at tables the same service owns.
+
+### Cardinality
+
+Each of the `0..1` relationships is a unique constraint, because each is a
+question that must have exactly one answer: one investigation per exception, one
+recommendation per investigation, one decision per investigation. Enforced by
+the database rather than by application checks, since two concurrent requests
+can both pass a check and only one can win a constraint.
+
+Detailed schemas are defined in `docs/data-model.md`.
 
 ---
 
@@ -1085,6 +1282,17 @@ The following rules should remain true even as ReconAI evolves:
 8. AI failures must not prevent deterministic reconciliation.
 9. Investigation activity must be auditable.
 10. Evaluation is required before agent behavior is considered reliable.
+11. Only a human transition completes an investigation. No confidence value,
+    guardrail outcome, or model output can reach `COMPLETED`.
+12. The Investigation Service issues no write to the Financial Core. Approval
+    records a judgement; it does not resolve an exception or move money.
+13. Routing between review and escalation is deterministic, reproducible from
+    the stored result, and decided by application code rather than the model.
+14. Model confidence is a self-report and is never treated as a calibrated
+    probability.
+15. No prompt, provider payload, or model reasoning is persisted or exposed
+    anywhere in the system.
+16. No database transaction is held open across a model call.
 
 ---
 
@@ -1111,16 +1319,25 @@ Python Investigation Agent
         |
         +---- get_transaction()
         |
-        +---- get_settlement()
+        +---- get_settlements()
         |
         +---- get_fee_rules()
         |
-        +---- search_policy_documents()
-        |
-        +---- get_transaction_history()
+        +---- search_policies()
         |
         v
-Evidence-Backed Recommendation
+Grounding validation
+(every citation checked against what was retrieved)
+        |
+        v
+Evidence-Backed Recommendation (stored)
+        |
+        v
+Deterministic guardrail
+        |
+        +---- AWAITING_REVIEW
+        |
+        +---- ESCALATED
         |
         v
 React Operations Console
@@ -1131,5 +1348,8 @@ Human Approve / Reject / Escalate
         v
 Audit Trail
 ```
+
+The backend of this path is implemented. The Operations Console is the remaining
+piece; the review and audit endpoints it will call exist and are tested.
 
 This vertical slice is the primary implementation target before additional functionality is introduced.

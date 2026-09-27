@@ -131,6 +131,23 @@ class InvestigationResult(BaseModel):
     def cites(self) -> list[str]:
         return [reference.describe() for reference in self.evidence]
 
+    @property
+    def confidence_value(self) -> Decimal:
+        """Confidence as an exact decimal, for comparison and storage.
+
+        The field itself stays a float because that is what arrives over JSON.
+        Every decision and every write uses this instead, so the guardrail
+        threshold comparison and the NUMERIC(5,4) column see the same value and
+        a boundary case cannot turn on binary rounding.
+
+        Via ``str`` rather than ``Decimal(float)``: 0.85 should become exactly
+        ``0.85``, not the full binary expansion of the nearest double.
+
+        This is a self-reported number, not a calibrated probability. Exactness
+        here is about reproducibility, and says nothing about its meaning.
+        """
+        return Decimal(str(self.confidence)).quantize(Decimal("0.0001"))
+
 
 def difference(expected: Decimal, settled: Decimal) -> Decimal:
     """Expected minus settled, computed here rather than believed from a model.

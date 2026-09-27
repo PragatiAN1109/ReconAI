@@ -7,6 +7,8 @@ through Testcontainers, because unique constraints under concurrency, sequences
 and transaction behaviour cannot be proven against a substitute.
 """
 
+from collections.abc import Iterator
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -126,3 +128,45 @@ def client(
     app = create_app(settings, consumer=consumer, database=database, financial_core=financial_core)
     with TestClient(app) as test_client:
         yield test_client
+
+
+# ---------------------------------------------------------------------------
+# A real PostgreSQL, shared by every integration module
+# ---------------------------------------------------------------------------
+
+
+def docker_is_available() -> bool:
+    try:
+        import docker  # noqa: PLC0415
+
+        docker.from_env().ping()
+        return True
+    except Exception:
+        return False
+
+
+@pytest.fixture(scope="session")
+def postgres_url() -> "Iterator[str]":
+    """A throwaway PostgreSQL with this service's schema migrated into it.
+
+    Session-scoped so one container serves every integration module: starting a
+    PostgreSQL per module costs far more than the isolation is worth, and each
+    module cleans up after itself.
+
+    The real Alembic migration runs here rather than ``create_all``, so these
+    tests exercise the schema the application actually deploys — constraints,
+    defaults and sequences included — instead of one rebuilt from ORM metadata.
+    """
+    if not docker_is_available():
+        pytest.skip("Docker is unavailable; skipping PostgreSQL integration tests")
+
+    from alembic import command  # noqa: PLC0415
+    from alembic.config import Config  # noqa: PLC0415
+    from testcontainers.community.postgres import PostgresContainer  # noqa: PLC0415
+
+    with PostgresContainer("postgres:16-alpine", driver="asyncpg") as container:
+        url = container.get_connection_url()
+        alembic_config = Config("alembic.ini")
+        alembic_config.set_main_option("sqlalchemy.url", url)
+        command.upgrade(alembic_config, "head")
+        yield url

@@ -71,8 +71,12 @@ def test_unknown_paths_return_404(client: TestClient) -> None:
     assert client.get("/does-not-exist").status_code == 404
 
 
-def test_no_business_endpoints_are_exposed_yet(client: TestClient) -> None:
-    """Phase 4.1 is a scaffold: health and readiness are the whole surface."""
+def test_the_exposed_surface_is_exactly_what_is_intended(client: TestClient) -> None:
+    """An exhaustive inventory, so a new endpoint cannot appear unnoticed.
+
+    This test is meant to fail whenever the surface changes. Updating it is how
+    adding an endpoint becomes a deliberate act rather than a side effect.
+    """
     paths = set(client.get("/openapi.json").json()["paths"])
 
     assert {"/health", "/ready"} <= paths
@@ -81,5 +85,30 @@ def test_no_business_endpoints_are_exposed_yet(client: TestClient) -> None:
         "/ready",
         "/api/v1/investigations",
         "/api/v1/investigations/{investigation_id}",
+        "/api/v1/investigations/{investigation_id}/recommendation",
+        "/api/v1/investigations/{investigation_id}/audit",
         "/api/v1/investigations/{investigation_id}/run",
+        "/api/v1/investigations/{investigation_id}/approve",
+        "/api/v1/investigations/{investigation_id}/reject",
+        "/api/v1/investigations/{investigation_id}/escalate",
     }
+
+
+def test_no_endpoint_can_mutate_a_financial_record(client: TestClient) -> None:
+    """Every path here belongs to this service's own resources.
+
+    The financial core is read-only to this service. Nothing in the surface
+    addresses a transaction, a settlement or an exception, so there is no
+    endpoint a client could mistake for one that writes to it.
+    """
+    paths = set(client.get("/openapi.json").json()["paths"])
+
+    business_paths = {path for path in paths if path.startswith("/api/")}
+    assert business_paths, "expected business endpoints to exist"
+    for path in business_paths:
+        assert path.startswith("/api/v1/investigations"), path
+    assert not any(
+        segment in path
+        for path in paths
+        for segment in ("/transactions", "/settlements", "/exceptions", "/fee-rules")
+    )

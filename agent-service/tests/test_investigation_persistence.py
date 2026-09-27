@@ -11,7 +11,7 @@ stays runnable on a machine with nothing installed.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 import pytest
@@ -27,38 +27,6 @@ from app.models import SCHEMA, InvestigationStatus
 pytestmark = pytest.mark.integration
 
 DETECTED_AT = datetime(2026, 9, 27, 2, 4, 16, 954772, tzinfo=UTC)
-
-
-def _docker_is_available() -> bool:
-    try:
-        import docker  # noqa: PLC0415
-
-        docker.from_env().ping()
-        return True
-    except Exception:
-        return False
-
-
-@pytest.fixture(scope="module")
-def postgres_url() -> Iterator[str]:
-    """A throwaway PostgreSQL with this service's schema migrated into it."""
-    if not _docker_is_available():
-        pytest.skip("Docker is unavailable; skipping PostgreSQL integration tests")
-
-    from alembic import command  # noqa: PLC0415
-    from alembic.config import Config  # noqa: PLC0415
-    from testcontainers.community.postgres import PostgresContainer  # noqa: PLC0415
-
-    with PostgresContainer("postgres:16-alpine", driver="asyncpg") as container:
-        url = container.get_connection_url()
-
-        # The real migration runs here, so these tests exercise the schema the
-        # application actually deploys rather than one built from ORM metadata.
-        alembic_config = Config("alembic.ini")
-        alembic_config.set_main_option("sqlalchemy.url", url)
-        command.upgrade(alembic_config, "head")
-
-        yield url
 
 
 @pytest.fixture
@@ -340,10 +308,17 @@ async def test_this_service_creates_nothing_outside_its_own_schema(
             )
         )
 
+    # Exhaustive, and every entry is in the investigation schema. The financial
+    # core's tables would appear here if a migration had ever created one.
     assert sorted(tables) == [
         f"{SCHEMA}.alembic_version",
+        f"{SCHEMA}.audit_events",
         f"{SCHEMA}.investigations",
+        f"{SCHEMA}.recommendation_evidence",
+        f"{SCHEMA}.recommendations",
+        f"{SCHEMA}.reviews",
     ]
+    assert all(table.startswith(f"{SCHEMA}.") for table in tables)
     assert not any("transactions" in table for table in tables)
     assert not any("settlements" in table for table in tables)
     assert not any("reconciliation_exceptions" in table for table in tables)

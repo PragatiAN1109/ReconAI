@@ -5,13 +5,17 @@ by the Spring Boot financial core. It is not a system of record: the financial
 core remains authoritative for transactions and settlements, and this service
 never writes to them.
 
-Phase 4.6 adds an investigator. A PENDING investigation can be run through a
-bounded loop in which a language model requests evidence through four controlled
-tools and proposes an explanation, which the application then checks against the
-evidence actually retrieved.
+Phase 4.7 completes the backend lifecycle. A PENDING investigation can be run
+through a bounded loop in which a language model requests evidence through four
+controlled tools and proposes an explanation. The application checks that
+explanation against the evidence actually retrieved, stores it, and a
+deterministic guardrail routes it to a human or escalates it. A human then
+approves, rejects or escalates, and every step is recorded in an append-only
+audit trail.
 
-The result is advisory and is not persisted. Nothing here approves anything or
-modifies a financial record.
+Every recommendation is advisory. Nothing here approves anything on its own,
+and nothing here writes to the financial core: this service reads from it and
+owns only its own schema.
 """
 
 import logging
@@ -24,10 +28,13 @@ from fastapi import FastAPI
 from app.config import Settings
 from app.database import Database
 from app.financial_core_client import FinancialCoreClient
+from app.audit_service import AuditService
 from app.health import router as health_router
 from app.investigation_service import InvestigationService
+from app.investigation_workflow import InvestigationWorkflow
 from app.investigations_api import router as investigations_router
 from app.kafka_consumer import ReconciliationExceptionConsumer
+from app.review_service import ReviewService
 from app.logging_config import configure_logging
 from app.investigation_agent import InvestigationAgent
 from app.investigation_model import InvestigationModel
@@ -88,6 +95,10 @@ def create_app(
     # per query would make results depend on filesystem timing.
     policies = PolicySearch(settings.policy_corpus_path)
     investigations = InvestigationService(database)
+    # Review and audit need no model and no financial-core client: a human
+    # decision and its record are entirely this service's own business.
+    reviews = ReviewService(database)
+    audit = AuditService(database)
 
     # Optional. With no model configured the service still consumes Kafka and
     # records investigations; only the investigation endpoint is unavailable,
@@ -101,6 +112,22 @@ def create_app(
             max_tool_rounds=settings.investigation_max_tool_rounds,
         )
         if investigation_model is not None
+        else None
+    )
+    # The workflow is what persists an outcome. Without a model there is
+    # nothing to run, so it is absent rather than a stub, and the run endpoint
+    # reports 503 instead of failing later.
+    investigation_workflow = (
+        InvestigationWorkflow(
+            database,
+            investigation_agent,
+            confidence_threshold=settings.review_confidence_threshold,
+            minimum_evidence=settings.review_minimum_evidence,
+            model_provider=settings.llm_provider,
+            model_name=settings.llm_model,
+            prompt_version=settings.prompt_version,
+        )
+        if investigation_agent is not None
         else None
     )
     consumer = consumer or ReconciliationExceptionConsumer(settings, investigations)
@@ -156,7 +183,7 @@ def create_app(
     app = FastAPI(
         title="ReconAI Investigation Service",
         description=DESCRIPTION,
-        version="0.6.0",
+        version="0.7.0",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -166,6 +193,9 @@ def create_app(
     app.state.financial_core = financial_core
     app.state.policies = policies
     app.state.investigation_agent = investigation_agent
+    app.state.investigation_workflow = investigation_workflow
+    app.state.reviews = reviews
+    app.state.audit = audit
     app.include_router(health_router)
     app.include_router(investigations_router)
     return app
