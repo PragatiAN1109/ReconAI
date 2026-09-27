@@ -10,16 +10,17 @@ read-only interfaces when those are built.
 
 > Deterministic systems detect. AI investigates. Humans authorize.
 
-## Phase 4.5 scope
+## Phase 4.6 scope
 
 The service consumes reconciliation exceptions from Kafka and records a `PENDING`
-investigation for each — exactly one per exception, however many times the event is
-delivered. It also offers **controlled read-only evidence tools**: transactions,
-settlements and fee rules from the Financial Core, plus excerpts from a local policy
-corpus.
+investigation for each. A recorded investigation can then be **run**: a language model
+requests evidence through four controlled tools, reasons over what comes back, and
+proposes an explanation — which the application checks against the evidence actually
+retrieved before accepting it.
 
-Nothing calls them automatically. No investigation runs, no cause is proposed, and no
-model is involved. See [Not implemented yet](#not-implemented-yet).
+**Results are not persisted and no lifecycle advances.** Running an investigation twice
+runs it twice and changes nothing either time. See
+[Not implemented yet](#not-implemented-yet).
 
 ## Prerequisites
 
@@ -92,6 +93,18 @@ locally, so the service starts with nothing set.
 | `RECONAI_AGENT_FINANCIAL_CORE_BASE_URL` | `http://localhost:8099` | Financial Core, for evidence |
 | `RECONAI_AGENT_FINANCIAL_CORE_TIMEOUT_SECONDS` | `5.0` | evidence request timeout |
 | `RECONAI_AGENT_POLICY_CORPUS_PATH` | `<repo>/policies` | policy corpus directory |
+| `RECONAI_AGENT_LLM_PROVIDER` | `none` | `none` or `anthropic` |
+| `RECONAI_AGENT_LLM_MODEL` | `claude-sonnet-5` | model identifier |
+| `RECONAI_AGENT_LLM_API_KEY` | *(unset)* | provider key; `SecretStr`, never logged |
+| `RECONAI_AGENT_INVESTIGATION_MAX_TOOL_ROUNDS` | `8` | bound on the tool loop |
+
+The provider defaults to `none`. The service runs, consumes Kafka and records
+investigations with no model configured at all; only the investigation endpoint is
+unavailable, and it reports that as `503` rather than failing at startup.
+
+**The API key has no default and is a `SecretStr`**, so it cannot be printed by an
+accidental `repr` of settings. It is never logged. Supply it through the environment —
+never in code, never in a committed file.
 
 The database port is **55432**, not 5432 — the Compose stack publishes PostgreSQL there
 so it does not collide with a local server. Keep it aligned with `RECONAI_POSTGRES_PORT`.
@@ -408,6 +421,132 @@ Inside a container, `localhost:8099` is the container itself. Point
 `RECONAI_AGENT_FINANCIAL_CORE_BASE_URL` at `host.docker.internal:8099` or a Compose
 service name instead; the default assumes host development.
 
+## Investigation
+
+```
+INV-1001 (PENDING)
+      ↓
+  bounded loop, at most 8 rounds
+      ↓  model requests a tool
+  application validates name + arguments, executes it, records what came back
+      ↓  evidence returned to the model
+      ↓  ... repeat ...
+      ↓  model submits a result
+  schema validation → evidence grounding → validated InvestigationResult
+```
+
+Run one (development entry point):
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/investigations/INV-1001/run
+```
+
+### The model's entire universe
+
+```
+get_transaction(transaction_id)
+get_settlements(transaction_id)
+get_fee_rules(merchant_id, processor, currency, active)
+search_policy_documents(query)
+```
+
+That is the whole allowlist. There is **no** generic HTTP request, no URL parameter, no
+SQL, no filesystem read, no shell and no code execution — not disabled, simply absent.
+The model may *request* a tool; the application decides whether it is allowed, validates
+the arguments against a strict schema, executes it, and records the result. A request
+for anything unrecognised is refused and reported back to the model, which is
+information it can act on rather than a reason to crash.
+
+Argument schemas forbid unexpected fields, so a plausible-looking request cannot smuggle
+in an extra parameter.
+
+### The result
+
+```json
+{
+  "classification": "PROCESSOR_FEE",
+  "rootCause": "An active 50.00 USD processing fee is consistent with the difference.",
+  "confidence": 0.86,
+  "evidence": [
+    {"sourceType": "TRANSACTION", "reference": "TX-10009"},
+    {"sourceType": "SETTLEMENT", "reference": "SET-8008"},
+    {"sourceType": "FEE_RULE", "reference": "FR-14"},
+    {"sourceType": "POLICY_DOCUMENT", "reference": "POL-FEE-001",
+     "section": "Cross-Network Settlement Fees"}
+  ],
+  "recommendedAction": "Review and classify the discrepancy as a processor fee adjustment.",
+  "requiresHumanApproval": true
+}
+```
+
+Classifications: `PROCESSOR_FEE`, `PROCESSOR_DELAY`, `DUPLICATE_PROCESSING`,
+`CURRENCY_CONVERSION`, `PROCESSOR_ERROR`, `UNKNOWN`, `INSUFFICIENT_EVIDENCE`.
+
+**This is a different enum from the deterministic exception type, deliberately.**
+Reconciliation says `AMOUNT_MISMATCH` — two records disagree. An investigation may say
+`PROCESSOR_FEE` — here is why. `PROCESSOR_FEE` is not and will never be a reconciliation
+exception type.
+
+`requiresHumanApproval` is pinned true by a validator: a result cannot describe itself as
+needing no review. `confidence` is the model's stated confidence, range-checked and
+nothing more — it is not calibrated, and nothing is approved or rejected on the strength
+of it.
+
+### Evidence grounding
+
+A model asked for its sources will produce plausible ones whether or not it saw them.
+`FR-999` looks exactly like `FR-14`. So the application keeps an **evidence ledger** —
+an in-memory record, scoped to one run, of every identifier the tools actually returned —
+and checks each citation against it:
+
+```
+ledger: transactions=[TX-10009] settlements=[SET-8008] fee_rules=[FR-14, FR-15] policies=[POL-FEE-001]
+result cites FR-999  →  UngroundedResultError, the whole result is rejected
+```
+
+One bad citation invalidates the result; nothing is silently dropped. A policy citation
+naming a section must match a section actually returned, because citing the right
+document and the wrong section is still a claim about text nobody read.
+
+Grounding is decided by the application, never asserted by the model.
+
+### Insufficient evidence
+
+`INSUFFICIENT_EVIDENCE` is a **successful outcome**, not a failure. The instructions
+explicitly prefer it to a plausible guess. An investigation that finds no matching fee
+rule reports that rather than reaching for the nearest explanation.
+
+### Bounded loop
+
+At most `RECONAI_AGENT_INVESTIGATION_MAX_TOOL_ROUNDS` rounds (default 8). An agent that
+can call tools indefinitely is an agent that can spend indefinitely. On exhausting the
+budget the investigation fails loudly — **no result is fabricated to fill the gap**.
+
+### Running with a fake model
+
+Every test uses a scripted `FakeModel` (`tests/fake_model.py`); none calls a provider.
+The workflow worth testing — allowlist, loop bound, ledger, grounding — is all on our
+side of the model boundary:
+
+```python
+model = FakeModel([
+    tool_turn("get_transaction", {"transaction_id": "TX-10009"}),
+    final_turn(evidence=[{"sourceType": "TRANSACTION", "reference": "TX-10009"}]),
+])
+result, ledger = await InvestigationAgent(model, core, policies).investigate(context)
+```
+
+### Configuring a real provider
+
+```bash
+pip install -e ".[llm]"
+RECONAI_AGENT_LLM_PROVIDER=anthropic RECONAI_AGENT_LLM_API_KEY=... python -m app.main
+```
+
+⚠️ **The Anthropic provider has not been verified against a live API.** No credentials
+were available when it was written, so the translation in `app/anthropic_model.py` is
+unexercised end to end. Treat the first real run as a verification step.
+
 ## Endpoints
 
 ### `GET /health` — liveness
@@ -573,13 +712,18 @@ and that is the end of it.
 `get_transaction` and `get_settlements` exist, but **nothing calls them automatically**.
 An investigation stays `PENDING`; there is no orchestrator.
 
-Absent by design: LLM and agent framework integration of any kind, agent reasoning,
-tool calling, `get_transaction_history`, investigation evidence persistence,
-recommendation generation and persistence, **root-cause classification** (including
-`PROCESSOR_FEE`, which is not a deterministic exception type and is not concluded
-anywhere), confidence scoring, semantic search, embeddings, vector stores, pgvector,
-approvals, audit workflow, authentication, a frontend, financial writes, and autonomous
-actions of any kind.
+An investigation can now propose an explanation. **Nothing is done with it.** The result
+is returned to the caller and discarded.
+
+Absent by design: result persistence, investigation evidence persistence, recommendation
+persistence, investigation lifecycle transitions (a run leaves the investigation
+`PENDING`), human approval workflow, confidence-threshold automation, automatic approval
+or escalation, audit events, `get_transaction_history`, semantic search, embeddings,
+vector stores, pgvector, multiple agents, a frontend, financial writes of any kind, and
+autonomous action of any kind.
+
+`PROCESSOR_FEE` remains a root-cause classification an investigation may propose. It is
+not, and must not become, a deterministic reconciliation exception type.
 
 Also absent, and worth naming because they are the natural next questions:
 

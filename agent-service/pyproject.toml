@@ -36,6 +36,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The model provider is optional. Everything except the investigation endpoint
+# works without it, and the whole test suite runs without it installed.
+llm = [
+    "anthropic>=0.40,<1.0",
+]
 dev = [
     "pytest>=8.3,<9.0",
     # Transport for fastapi.testclient.TestClient. Starlette now deprecates the
@@ -46,6 +51,9 @@ dev = [
     # unique constraints under concurrency, sequences, transaction behaviour.
     # These tests skip automatically when Docker is unavailable.
     "testcontainers[postgres]>=4.8,<5.0",
+    # Needed to build real SDK response objects in the adapter tests. Tests
+    # construct them directly and never call the API.
+    "anthropic>=0.40,<1.0",
 ]
 
 [project.scripts]

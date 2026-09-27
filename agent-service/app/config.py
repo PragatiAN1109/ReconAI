@@ -3,11 +3,12 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal["local", "dev", "test", "prod"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+LlmProvider = Literal["none", "anthropic"]
 
 
 class Settings(BaseSettings):
@@ -70,6 +71,23 @@ class Settings(BaseSettings):
     # service works from a checkout without configuration, and overridable so
     # tests can point at a fixture corpus.
     policy_corpus_path: Path = Path(__file__).resolve().parent.parent.parent / "policies"
+
+    # Investigation model. The provider defaults to "none": the service runs,
+    # consumes Kafka and records investigations with no model configured at all,
+    # and only the investigation endpoint is unavailable.
+    #
+    # SecretStr so the key cannot be printed by an accidental repr of settings.
+    # It is never logged and never leaves the provider client.
+    llm_provider: LlmProvider = "none"
+    llm_model: str = "claude-sonnet-5"
+    llm_api_key: SecretStr | None = None
+    #: Upper bound on tool rounds in one investigation. An unbounded agent loop
+    #: is an unbounded bill.
+    investigation_max_tool_rounds: int = Field(default=8, ge=1, le=20)
+
+    @property
+    def investigation_model_configured(self) -> bool:
+        return self.llm_provider != "none" and self.llm_api_key is not None
 
     @property
     def redacted_database_url(self) -> str:

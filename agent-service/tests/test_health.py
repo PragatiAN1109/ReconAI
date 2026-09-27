@@ -76,4 +76,10 @@ def test_no_business_endpoints_are_exposed_yet(client: TestClient) -> None:
     paths = set(client.get("/openapi.json").json()["paths"])
 
     assert {"/health", "/ready"} <= paths
-    assert paths == {"/health", "/ready", "/api/v1/investigations", "/api/v1/investigations/{investigation_id}"}
+    assert paths == {
+        "/health",
+        "/ready",
+        "/api/v1/investigations",
+        "/api/v1/investigations/{investigation_id}",
+        "/api/v1/investigations/{investigation_id}/run",
+    }

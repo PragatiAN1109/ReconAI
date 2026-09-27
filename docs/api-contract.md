@@ -850,6 +850,52 @@ GET /api/v1/investigations/{investigationId}
 
 ---
 
+# 17.3 Run Investigation (implemented, development entry point)
+
+```http
+POST /api/v1/investigations/{investigationId}/run
+```
+
+Served by the **Investigation Service**, which owns investigations, not by the Financial
+Core. Triggers reasoning and returns the validated result.
+
+### Response
+
+```json
+{
+  "investigation_id": "INV-1001",
+  "result": {
+    "classification": "PROCESSOR_FEE",
+    "rootCause": "An active 50.00 USD processing fee is consistent with the difference.",
+    "confidence": 0.86,
+    "evidence": [
+      {"sourceType": "SETTLEMENT", "reference": "SET-8008"},
+      {"sourceType": "FEE_RULE", "reference": "FR-14"},
+      {"sourceType": "POLICY_DOCUMENT", "reference": "POL-FEE-001",
+       "section": "Cross-Network Settlement Fees"}
+    ],
+    "recommendedAction": "Review and classify the discrepancy as a processor fee adjustment.",
+    "requiresHumanApproval": true
+  },
+  "evidence_retrieved": {
+    "transactions": ["TX-10009"],
+    "settlements": ["SET-8008"],
+    "feeRules": ["FR-14", "FR-15"],
+    "policyDocuments": ["POL-FEE-001"]
+  }
+}
+```
+
+`evidence_retrieved` is the application's own record of what the tools returned, reported
+alongside the model's citations so a reviewer can see the difference between what was
+available and what was cited.
+
+It approves nothing, modifies no financial record, does not persist the result, and
+leaves the investigation in its existing status. `422` when the result was malformed or
+cited evidence that was never retrieved; `503` when no model is configured.
+
+---
+
 # 18. Internal Agent Result API
 
 After investigation, the Agent Service must return its structured result to the Financial Core.

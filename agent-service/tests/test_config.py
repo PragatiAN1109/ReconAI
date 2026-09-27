@@ -57,12 +57,64 @@ def test_an_unknown_environment_is_rejected() -> None:
         Settings(_env_file=None, environment="staging-ish")
 
 
-def test_configuration_holds_no_credentials() -> None:
-    """This phase talks to nothing, so nothing here should look like a secret."""
-    suspicious = ("password", "secret", "token", "api_key", "apikey", "credential")
-    names = set(Settings.model_fields)
+def test_the_only_credential_has_no_default_and_is_a_secret() -> None:
+    """The model API key is the one secret this service takes.
 
-    assert not [name for name in names if any(word in name for word in suspicious)]
+    It must have no default — a hardcoded key is the failure this guards — and
+    must be a SecretStr so an accidental repr or log of settings cannot print it.
+    """
+    suspicious = ("password", "secret", "token", "api_key", "apikey", "credential")
+    credentials = [
+        name for name in Settings.model_fields if any(word in name for word in suspicious)
+    ]
+
+    assert credentials == ["llm_api_key"]
+    assert Settings(_env_file=None).llm_api_key is None
+
+
+def test_a_configured_api_key_is_not_printable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RECONAI_AGENT_LLM_API_KEY", "sk-do-not-print-me")
+
+    settings = Settings(_env_file=None)
+
+    assert "do-not-print-me" not in repr(settings)
+    assert "do-not-print-me" not in str(settings.llm_api_key)
+    assert settings.llm_api_key.get_secret_value() == "sk-do-not-print-me"
+
+
+def test_no_model_is_configured_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The service runs with no provider at all; only investigation is unavailable."""
+    for name in ("LLM_PROVIDER", "LLM_API_KEY"):
+        monkeypatch.delenv(f"RECONAI_AGENT_{name}", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.llm_provider == "none"
+    assert settings.investigation_model_configured is False
+
+
+def test_a_provider_needs_both_a_name_and_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RECONAI_AGENT_LLM_PROVIDER", "anthropic")
+    monkeypatch.delenv("RECONAI_AGENT_LLM_API_KEY", raising=False)
+    assert Settings(_env_file=None).investigation_model_configured is False
+
+    monkeypatch.setenv("RECONAI_AGENT_LLM_API_KEY", "sk-test")
+    assert Settings(_env_file=None).investigation_model_configured is True
+
+
+def test_an_unknown_provider_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, llm_provider="mystery-corp")
+
+
+def test_the_tool_round_bound_is_constrained() -> None:
+    """An unbounded agent loop is an unbounded bill."""
+    assert Settings(_env_file=None).investigation_max_tool_rounds == 8
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, investigation_max_tool_rounds=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, investigation_max_tool_rounds=500)
 
 
 # ---------------------------------------------------------------------------

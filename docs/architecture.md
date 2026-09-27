@@ -278,6 +278,12 @@ That resolution is implemented as a deliberately narrow read-only client exposin
 
 Policy evidence comes from a separate tool, `search_policy_documents`, over a small corpus of synthetic Markdown documents in `policies/`. V1 retrieval is deterministic lexical matching — no embeddings, no vector store, no pgvector. Results cite the document identifier and section they came from, so a later conclusion can be traced to its source. That tool exposes a query and nothing else: no file reading, no directory listing and no path argument.
 
+An investigation can now be run. A language model receives the four controlled tools and nothing else — no generic HTTP, no SQL, no filesystem, no code execution — and works within a bounded loop, at most eight tool rounds, after which the investigation fails rather than fabricating a conclusion. The model may request a tool; the application validates the name and arguments, executes it, and records what came back.
+
+Grounding is decided by the application rather than asserted by the model. Every identifier a tool returns is written to an in-memory evidence ledger scoped to that run, and every citation in the final result is checked against it. A citation the ledger cannot vouch for invalidates the whole result: a reference that cannot be traced to a retrieval is a fabrication, however plausible the identifier looks. `INSUFFICIENT_EVIDENCE` is a first-class successful outcome, preferred to a plausible guess.
+
+The result is advisory and is **not persisted**. Running an investigation does not change the investigation record, does not resolve anything, and cannot modify a financial record. `requiresHumanApproval` is pinned true so a result cannot describe itself as needing no review. Persistence, lifecycle and human review are later phases.
+
 Fee rules are structured configuration owned by the financial core and are **evidence only**. Reconciliation never reads them: a settlement difference is an `AMOUNT_MISMATCH` whether or not a fee rule of the same amount exists. Nothing in either service concludes `PROCESSOR_FEE`; that remains a root-cause classification for investigation to propose and a human to authorise. Nothing invokes any of these tools automatically yet. See `agent-service/README.md` for offset, readiness, migration and evidence detail.
 
 ---

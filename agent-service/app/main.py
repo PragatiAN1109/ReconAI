@@ -5,11 +5,13 @@ by the Spring Boot financial core. It is not a system of record: the financial
 core remains authoritative for transactions and settlements, and this service
 never writes to them.
 
-Phase 4.5 consumes reconciliation exceptions from Kafka, records a PENDING
-investigation for each, and offers controlled read-only ways to retrieve
-evidence: transactions, settlements and fee rules from the financial core, and
-excerpts from a local policy corpus. Nothing uses them automatically. No
-investigation runs, no cause is proposed, and no model is called.
+Phase 4.6 adds an investigator. A PENDING investigation can be run through a
+bounded loop in which a language model requests evidence through four controlled
+tools and proposes an explanation, which the application then checks against the
+evidence actually retrieved.
+
+The result is advisory and is not persisted. Nothing here approves anything or
+modifies a financial record.
 """
 
 import logging
@@ -27,6 +29,8 @@ from app.investigation_service import InvestigationService
 from app.investigations_api import router as investigations_router
 from app.kafka_consumer import ReconciliationExceptionConsumer
 from app.logging_config import configure_logging
+from app.investigation_agent import InvestigationAgent
+from app.investigation_model import InvestigationModel
 from app.policy_search import PolicySearch
 
 logger = logging.getLogger(__name__)
@@ -37,11 +41,38 @@ DESCRIPTION = (
 )
 
 
+def _build_model(settings: Settings) -> InvestigationModel | None:
+    """Construct the configured provider, or none.
+
+    Imported lazily so the provider SDK stays an optional dependency.
+    """
+    if not settings.investigation_model_configured:
+        logger.info(
+            "No investigation model configured; the investigation endpoint will report "
+            "itself unavailable [provider=%s]",
+            settings.llm_provider,
+        )
+        return None
+
+    from app.anthropic_model import AnthropicInvestigationModel  # noqa: PLC0415
+
+    assert settings.llm_api_key is not None
+    logger.info(
+        "Investigation model configured [provider=%s model=%s]",
+        settings.llm_provider,
+        settings.llm_model,
+    )
+    return AnthropicInvestigationModel(
+        api_key=settings.llm_api_key.get_secret_value(), model=settings.llm_model
+    )
+
+
 def create_app(
     settings: Settings | None = None,
     consumer: ReconciliationExceptionConsumer | None = None,
     database: Database | None = None,
     financial_core: FinancialCoreClient | None = None,
+    investigation_model: InvestigationModel | None = None,
 ) -> FastAPI:
     """Build the application.
 
@@ -57,6 +88,21 @@ def create_app(
     # per query would make results depend on filesystem timing.
     policies = PolicySearch(settings.policy_corpus_path)
     investigations = InvestigationService(database)
+
+    # Optional. With no model configured the service still consumes Kafka and
+    # records investigations; only the investigation endpoint is unavailable,
+    # which it reports as 503 rather than failing at startup.
+    investigation_model = investigation_model or _build_model(settings)
+    investigation_agent = (
+        InvestigationAgent(
+            investigation_model,
+            financial_core,
+            policies,
+            max_tool_rounds=settings.investigation_max_tool_rounds,
+        )
+        if investigation_model is not None
+        else None
+    )
     consumer = consumer or ReconciliationExceptionConsumer(settings, investigations)
 
     @asynccontextmanager
@@ -110,7 +156,7 @@ def create_app(
     app = FastAPI(
         title="ReconAI Investigation Service",
         description=DESCRIPTION,
-        version="0.5.0",
+        version="0.6.0",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -119,6 +165,7 @@ def create_app(
     app.state.investigations = investigations
     app.state.financial_core = financial_core
     app.state.policies = policies
+    app.state.investigation_agent = investigation_agent
     app.include_router(health_router)
     app.include_router(investigations_router)
     return app
