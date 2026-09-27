@@ -29,3 +29,14 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = Field(default=8000, ge=1, le=65535)
     log_level: LogLevel = "INFO"
+
+    # Kafka. The default suits running this service on the host against the
+    # Compose broker. Inside a container "localhost" would mean the container
+    # itself, so a containerised deployment must set this to the broker's
+    # reachable address.
+    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_exceptions_topic: str = "reconciliation.exceptions"
+    # Fixed, never generated: a stable group keeps committed offsets across
+    # restarts and lets several instances share partitions instead of each one
+    # receiving every event.
+    kafka_consumer_group: str = "reconai-investigation-service"

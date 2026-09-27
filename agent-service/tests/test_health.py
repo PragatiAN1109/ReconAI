@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.health import HealthResponse, ReadinessResponse
 from app.main import create_app
+from tests.conftest import FakeConsumer
 
 
 def test_health_returns_200(client: TestClient) -> None:
@@ -37,6 +38,7 @@ def test_ready_reports_the_service_as_ready(client: TestClient) -> None:
     assert response.json() == {
         "status": "READY",
         "service": "reconai-investigation-service",
+        "kafka_consumer": "RUNNING",
     }
 
 
@@ -45,6 +47,7 @@ def test_ready_response_matches_its_schema(client: TestClient) -> None:
 
     assert body.status == "READY"
     assert body.service == "reconai-investigation-service"
+    assert body.kafka_consumer == "RUNNING"
 
 
 def test_endpoints_return_json(client: TestClient) -> None:
@@ -55,7 +58,9 @@ def test_endpoints_return_json(client: TestClient) -> None:
 def test_service_name_in_responses_comes_from_configuration() -> None:
     renamed = Settings(service_name="renamed-service", environment="test")
 
-    with TestClient(create_app(renamed)) as client:
+    # A fake consumer is passed explicitly: without one this would construct the
+    # real Kafka consumer and the test would depend on a running broker.
+    with TestClient(create_app(renamed, consumer=FakeConsumer())) as client:
         assert client.get("/health").json()["service"] == "renamed-service"
         assert client.get("/ready").json()["service"] == "renamed-service"
 

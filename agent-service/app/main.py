@@ -5,7 +5,8 @@ by the Spring Boot financial core. It is not a system of record: the financial
 core remains authoritative for transactions and settlements, and this service
 never writes to them.
 
-Phase 4.1 is the scaffold only — configuration, logging, health and readiness.
+Phase 4.2 consumes reconciliation exceptions from Kafka and validates them.
+It stops there: nothing is investigated, fetched, persisted or sent to a model.
 """
 
 import logging
@@ -17,6 +18,7 @@ from fastapi import FastAPI
 
 from app.config import Settings
 from app.health import router as health_router
+from app.kafka_consumer import ReconciliationExceptionConsumer
 from app.logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -27,15 +29,19 @@ DESCRIPTION = (
 )
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    consumer: ReconciliationExceptionConsumer | None = None,
+) -> FastAPI:
     """Build the application.
 
-    Settings are a parameter rather than a module-level singleton so that tests
-    can construct an application with whatever configuration they need, without
-    mutating global state or clearing caches.
+    Settings and the consumer are parameters rather than module-level
+    singletons so that tests can supply their own, without global state, cache
+    clearing or a broker.
     """
     settings = settings or Settings()
     configure_logging(settings.log_level)
+    consumer = consumer or ReconciliationExceptionConsumer(settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -46,16 +52,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.host,
             settings.port,
         )
-        yield
-        logger.info("Investigation service stopped [service=%s]", settings.service_name)
+        try:
+            await consumer.start()
+        except Exception:
+            # An unreachable broker must not stop the process from starting.
+            # Liveness stays up, readiness reports NOT_READY, and an
+            # orchestrator can route away from this instance rather than watch
+            # it crash-loop through an outage it cannot fix.
+            logger.exception(
+                "Kafka consumer failed to start; the service will report itself as not ready "
+                "[bootstrap_servers=%s topic=%s]",
+                settings.kafka_bootstrap_servers,
+                settings.kafka_exceptions_topic,
+            )
+
+        try:
+            yield
+        finally:
+            await consumer.stop()
+            logger.info("Investigation service stopped [service=%s]", settings.service_name)
 
     app = FastAPI(
         title="ReconAI Investigation Service",
         description=DESCRIPTION,
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.consumer = consumer
     app.include_router(health_router)
     return app
 

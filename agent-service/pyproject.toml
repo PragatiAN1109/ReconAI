@@ -9,14 +9,18 @@ description = "AI-assisted investigation service for ReconAI reconciliation exce
 readme = "README.md"
 requires-python = ">=3.12"
 
-# Runtime only. No Kafka client, no model provider SDK and no agent framework:
-# none of those are used in Phase 4.1, and an unused dependency is still a
-# dependency to patch and audit.
+# Runtime only. No model provider SDK and no agent framework: neither is used
+# yet, and an unused dependency is still one to patch and audit.
 dependencies = [
     "fastapi>=0.115,<1.0",
     "uvicorn[standard]>=0.32,<1.0",
     "pydantic>=2.9,<3.0",
     "pydantic-settings>=2.6,<3.0",
+    # Native asyncio Kafka client. Chosen over confluent-kafka, whose synchronous
+    # C-extension API would need a background thread bridged into FastAPI's event
+    # loop, and over kafka-python-ng, which is synchronous and less actively
+    # maintained. Three pure-Python transitive dependencies.
+    "aiokafka>=0.12,<1.0",
 ]
 
 [project.optional-dependencies]

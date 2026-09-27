@@ -63,3 +63,49 @@ def test_configuration_holds_no_credentials() -> None:
     names = set(Settings.model_fields)
 
     assert not [name for name in names if any(word in name for word in suspicious)]
+
+
+# ---------------------------------------------------------------------------
+# Kafka configuration
+# ---------------------------------------------------------------------------
+
+
+def test_kafka_defaults_target_the_local_compose_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "KAFKA_BOOTSTRAP_SERVERS",
+        "KAFKA_EXCEPTIONS_TOPIC",
+        "KAFKA_CONSUMER_GROUP",
+    ):
+        monkeypatch.delenv(f"RECONAI_AGENT_{name}", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.kafka_bootstrap_servers == "localhost:9092"
+    assert settings.kafka_exceptions_topic == "reconciliation.exceptions"
+    assert settings.kafka_consumer_group == "reconai-investigation-service"
+
+
+def test_the_topic_default_matches_what_the_financial_core_publishes_to() -> None:
+    """The producer's default is reconciliation.exceptions; these must agree."""
+    assert Settings(_env_file=None).kafka_exceptions_topic == "reconciliation.exceptions"
+
+
+def test_kafka_settings_can_be_overridden_by_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RECONAI_AGENT_KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+    monkeypatch.setenv("RECONAI_AGENT_KAFKA_EXCEPTIONS_TOPIC", "other.topic")
+    monkeypatch.setenv("RECONAI_AGENT_KAFKA_CONSUMER_GROUP", "other-group")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.kafka_bootstrap_servers == "kafka:9092"
+    assert settings.kafka_exceptions_topic == "other.topic"
+    assert settings.kafka_consumer_group == "other-group"
+
+
+def test_the_consumer_group_is_fixed_rather_than_generated() -> None:
+    """A generated group id would replay or duplicate work on every restart."""
+    assert Settings(_env_file=None).kafka_consumer_group == Settings(_env_file=None).kafka_consumer_group

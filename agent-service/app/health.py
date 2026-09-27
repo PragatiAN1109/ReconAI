@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response, status
 from pydantic import BaseModel
 
 router = APIRouter(tags=["health"])
@@ -16,24 +16,43 @@ class HealthResponse(BaseModel):
 
 
 class ReadinessResponse(BaseModel):
-    """Readiness: the service is able to accept work.
+    """Readiness: the service can do its job.
 
-    The service has no external dependencies in this phase — no Kafka, no
-    database, no model provider — so readiness is equivalent to having started
-    successfully. Reporting on dependencies that do not exist would be a
-    fabricated check, so this stays honest and gains real checks when there is
-    something real to check.
+    That job is consuming reconciliation exceptions, so readiness follows the
+    Kafka consumer. It reports READY only when the consumer connected at startup
+    and its loop is still alive, and returns 503 otherwise so an orchestrator
+    stops routing to an instance that is processing nothing.
+
+    What this does *not* do is re-probe the broker on every call. It reflects
+    the consumer's own state, which catches the failures that matter — a broker
+    unreachable at startup, and a consumer loop that has died — without turning
+    every readiness poll into broker traffic.
     """
 
-    status: Literal["READY"]
+    status: Literal["READY", "NOT_READY"]
     service: str
+    kafka_consumer: Literal["RUNNING", "NOT_RUNNING"]
 
 
 @router.get("/health", response_model=HealthResponse, summary="Liveness probe")
 def health(request: Request) -> HealthResponse:
+    """Liveness only.
+
+    Deliberately independent of Kafka. A broker outage does not mean this
+    process should be killed and restarted; it means this instance is not ready.
+    Conflating the two would turn a broker blip into a restart loop.
+    """
     return HealthResponse(status="UP", service=request.app.state.settings.service_name)
 
 
 @router.get("/ready", response_model=ReadinessResponse, summary="Readiness probe")
-def ready(request: Request) -> ReadinessResponse:
-    return ReadinessResponse(status="READY", service=request.app.state.settings.service_name)
+def ready(request: Request, response: Response) -> ReadinessResponse:
+    consumer_running = request.app.state.consumer.is_running
+    if not consumer_running:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    return ReadinessResponse(
+        status="READY" if consumer_running else "NOT_READY",
+        service=request.app.state.settings.service_name,
+        kafka_consumer="RUNNING" if consumer_running else "NOT_RUNNING",
+    )

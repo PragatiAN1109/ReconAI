@@ -256,10 +256,18 @@ AFTER_COMMIT event
 Kafka: reconciliation.exceptions
         |
         v
-Future Investigation Agent
+Investigation Service consumer
+        |
+        v
+Pydantic validation
+        |
+        v
+(investigation: not yet implemented)
 ```
 
 **Why Kafka exists.** AI investigation has variable latency and independent failure modes. Placing a queue between detection and investigation means a slow, failing or entirely absent investigation service cannot affect whether the financial core establishes that two authoritative records disagree.
+
+The Python service consumes the topic under the fixed group `reconai-investigation-service`, with `auto.offset.reset=latest` and manual commits after each record. Delivery is at-least-once, so investigation handling must be idempotent by `exceptionId` once it exists. Today the consumer validates the event against the contract and logs it; nothing is investigated, fetched or persisted. See `agent-service/README.md` for the consumer's offset, readiness and error-handling behaviour.
 
 ---
 
