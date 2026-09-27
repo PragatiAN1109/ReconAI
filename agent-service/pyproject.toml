@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reconai-investigation-service"
+version = "0.1.0"
+description = "AI-assisted investigation service for ReconAI reconciliation exceptions"
+readme = "README.md"
+requires-python = ">=3.12"
+
+# Runtime only. No Kafka client, no model provider SDK and no agent framework:
+# none of those are used in Phase 4.1, and an unused dependency is still a
+# dependency to patch and audit.
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32,<1.0",
+    "pydantic>=2.9,<3.0",
+    "pydantic-settings>=2.6,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9.0",
+    # Transport for fastapi.testclient.TestClient. Starlette now deprecates the
+    # original httpx here and asks for httpx2, so using it keeps test runs clean.
+    "httpx2>=2.0,<3.0",
+]
+
+[project.scripts]
+reconai-investigation-service = "app.main:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
