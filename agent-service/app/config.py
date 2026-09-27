@@ -1,5 +1,6 @@
 """Typed configuration for the investigation service."""
 
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
@@ -63,6 +64,12 @@ class Settings(BaseSettings):
     # Evidence retrieval happens inside an investigation, not on a request path,
     # so a few seconds of patience is fine — but an unbounded wait is not.
     financial_core_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+
+    # Policy corpus. Synthetic Markdown documents searched lexically; see
+    # policies/README.md. Resolved relative to the repository root so the
+    # service works from a checkout without configuration, and overridable so
+    # tests can point at a fixture corpus.
+    policy_corpus_path: Path = Path(__file__).resolve().parent.parent.parent / "policies"
 
     @property
     def redacted_database_url(self) -> str:

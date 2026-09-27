@@ -592,7 +592,59 @@ GET /api/v1/agent-tools/transactions/{transactionId}/settlements
 
 # 14. get_fee_rules Tool
 
-## Endpoint
+## Implemented Endpoint
+
+```http
+GET /api/v1/fee-rules
+```
+
+Optional filters:
+
+```text
+merchantId
+processor
+currency
+active
+```
+
+Example:
+
+```http
+GET /api/v1/fee-rules?merchantId=MERCHANT-104&processor=NORTHSTAR_PAYMENTS&active=true
+```
+
+### Response
+
+```json
+{
+  "items": [
+    {
+      "ruleId": "FR-14",
+      "merchantId": "MERCHANT-104",
+      "processor": "NORTHSTAR_PAYMENTS",
+      "feeType": "PROCESSING",
+      "feeAmount": 50.00,
+      "currency": "USD",
+      "description": "Cross-network settlement processing fee applied per settled purchase.",
+      "active": true
+    }
+  ],
+  "total": 1
+}
+```
+
+Read-only: there is no create, update or delete path. A `merchantId` filter also returns
+rules with no merchant, since those apply to every merchant on the processor.
+
+The envelope is `{items, total}`, matching the other list endpoints in the implemented
+API rather than the merchant-keyed shape sketched below. The endpoint also sits on the
+normal `/api/v1` path rather than an `agent-tools` prefix, consistent with the
+transaction and settlement reads the investigation service already uses.
+
+## Originally Sketched Endpoint
+
+The following was the original sketch, retained for reference. It has not been
+implemented.
 
 ```http
 GET /api/v1/agent-tools/merchants/{merchantId}/fee-rules

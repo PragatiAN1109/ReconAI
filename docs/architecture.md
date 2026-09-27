@@ -274,7 +274,11 @@ The Python service consumes the topic under the fixed group `reconai-investigati
 
 The investigation service owns the `investigation` schema and writes nowhere else. It never reads or writes `transactions`, `settlements` or `reconciliation_exceptions`, and holds no foreign keys into them; `exceptionId` and `transactionId` are resolved through the financial core's API instead.
 
-That resolution is implemented as a deliberately narrow read-only client exposing exactly two operations — `get_transaction` and `get_settlements`, against `GET /api/v1/transactions/{id}` and `GET /api/v1/transactions/{id}/settlements`. There is no generic request method and no write operation, because these methods are the allowlist a future investigation agent receives: anything added here becomes a capability that agent has. Monetary evidence is carried as decimal and never as floating point. Nothing invokes these tools automatically yet. See `agent-service/README.md` for offset, readiness, migration and evidence detail.
+That resolution is implemented as a deliberately narrow read-only client exposing three operations — `get_transaction`, `get_settlements` and `get_fee_rules`, against `GET /api/v1/transactions/{id}`, `GET /api/v1/transactions/{id}/settlements` and `GET /api/v1/fee-rules`. There is no generic request method and no write operation, because these methods are the allowlist a future investigation agent receives: anything added here becomes a capability that agent has. Monetary evidence is carried as decimal and never as floating point.
+
+Policy evidence comes from a separate tool, `search_policy_documents`, over a small corpus of synthetic Markdown documents in `policies/`. V1 retrieval is deterministic lexical matching — no embeddings, no vector store, no pgvector. Results cite the document identifier and section they came from, so a later conclusion can be traced to its source. That tool exposes a query and nothing else: no file reading, no directory listing and no path argument.
+
+Fee rules are structured configuration owned by the financial core and are **evidence only**. Reconciliation never reads them: a settlement difference is an `AMOUNT_MISMATCH` whether or not a fee rule of the same amount exists. Nothing in either service concludes `PROCESSOR_FEE`; that remains a root-cause classification for investigation to propose and a human to authorise. Nothing invokes any of these tools automatically yet. See `agent-service/README.md` for offset, readiness, migration and evidence detail.
 
 ---
 

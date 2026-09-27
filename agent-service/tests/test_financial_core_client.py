@@ -14,6 +14,8 @@ import pytest
 
 from app.config import Settings
 from app.evidence_models import (
+    FeeRuleEvidence,
+    FeeType,
     SettlementEvidence,
     SettlementStatus,
     TransactionEvidence,
@@ -330,7 +332,7 @@ def test_the_client_exposes_only_the_two_read_operations() -> None:
         if not name.startswith("_") and callable(getattr(FinancialCoreClient, name))
     }
 
-    assert public == {"get_transaction", "get_settlements", "open", "close"}
+    assert public == {"get_transaction", "get_settlements", "get_fee_rules", "open", "close"}
 
 
 def test_no_write_operation_is_exposed() -> None:
@@ -402,3 +404,190 @@ async def test_the_configured_base_url_and_timeout_are_applied() -> None:
     assert str(core._client.base_url) == "http://financial-core.internal:9000"  # noqa: SLF001
     assert core._client.timeout.read == 2.5  # noqa: SLF001
     await core.close()
+
+
+# ---------------------------------------------------------------------------
+# get_fee_rules
+# ---------------------------------------------------------------------------
+
+FEE_RULE_JSON = {
+    "ruleId": "FR-14",
+    "merchantId": "MERCHANT-PHASE43-DEMO",
+    "processor": "NORTHSTAR_PAYMENTS",
+    "feeType": "PROCESSING",
+    "feeAmount": 50.00,
+    "currency": "USD",
+    "description": "Cross-network settlement processing fee applied per settled purchase.",
+    "active": True,
+}
+
+
+async def test_get_fee_rules_calls_the_documented_endpoint() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"items": [], "total": 0})
+
+    await client_with(handler).get_fee_rules()
+
+    assert seen[0].url.path == "/api/v1/fee-rules"
+    assert seen[0].method == "GET"
+
+
+async def test_fee_rule_filters_are_encoded_as_query_parameters() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"items": [], "total": 0})
+
+    await client_with(handler).get_fee_rules(
+        merchant_id="MERCHANT-PHASE43-DEMO",
+        processor="NORTHSTAR_PAYMENTS",
+        currency="USD",
+        active=True,
+    )
+
+    params = dict(seen[0].url.params)
+    assert params == {
+        "merchantId": "MERCHANT-PHASE43-DEMO",
+        "processor": "NORTHSTAR_PAYMENTS",
+        "currency": "USD",
+        "active": "true",
+    }
+
+
+async def test_omitted_filters_are_not_sent() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"items": [], "total": 0})
+
+    await client_with(handler).get_fee_rules(processor="NORTHSTAR_PAYMENTS")
+
+    assert dict(seen[0].url.params) == {"processor": "NORTHSTAR_PAYMENTS"}
+
+
+async def test_the_active_filter_is_encoded_the_way_spring_parses_it() -> None:
+    """Python's str(False) is "False"; Spring expects "false"."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"items": [], "total": 0})
+
+    await client_with(handler).get_fee_rules(active=False)
+
+    assert dict(seen[0].url.params) == {"active": "false"}
+
+
+async def test_a_fee_rule_response_maps_to_typed_evidence() -> None:
+    payload = {"items": [FEE_RULE_JSON], "total": 1}
+
+    rules = await client_with(responds(payload)).get_fee_rules()
+
+    assert len(rules) == 1
+    rule = rules[0]
+    assert isinstance(rule, FeeRuleEvidence)
+    assert rule.rule_id == "FR-14"
+    assert rule.merchant_id == "MERCHANT-PHASE43-DEMO"
+    assert rule.processor == "NORTHSTAR_PAYMENTS"
+    assert rule.fee_type is FeeType.PROCESSING
+    assert rule.currency == "USD"
+    assert rule.active is True
+
+
+async def test_fee_amounts_stay_decimal_and_exact() -> None:
+    payload = {"items": [{**FEE_RULE_JSON, "feeAmount": 50.00}], "total": 1}
+
+    rules = await client_with(responds(payload)).get_fee_rules()
+
+    assert isinstance(rules[0].fee_amount, Decimal)
+    assert rules[0].fee_amount == Decimal("50.00")
+
+
+async def test_a_fee_amount_that_a_float_would_corrupt_survives() -> None:
+    payload = {"items": [{**FEE_RULE_JSON, "feeAmount": 0.1}], "total": 1}
+
+    rules = await client_with(responds(payload)).get_fee_rules()
+
+    assert rules[0].fee_amount == Decimal("0.1")
+    assert str(rules[0].fee_amount) == "0.1"
+
+
+async def test_no_matching_rules_returns_an_empty_list_not_an_error() -> None:
+    """"This processor has no such fee" is a legitimate, useful answer."""
+    rules = await client_with(responds({"items": [], "total": 0})).get_fee_rules()
+
+    assert rules == []
+
+
+async def test_several_fee_rules_are_all_preserved() -> None:
+    payload = {
+        "items": [
+            FEE_RULE_JSON,
+            {**FEE_RULE_JSON, "ruleId": "FR-15", "merchantId": None, "feeType": "NETWORK"},
+            {**FEE_RULE_JSON, "ruleId": "FR-17", "active": False},
+        ],
+        "total": 3,
+    }
+
+    rules = await client_with(responds(payload)).get_fee_rules()
+
+    assert [rule.rule_id for rule in rules] == ["FR-14", "FR-15", "FR-17"]
+    assert rules[1].merchant_id is None
+    assert rules[2].active is False
+
+
+async def test_a_rule_applying_to_every_merchant_has_no_merchant() -> None:
+    payload = {"items": [{**FEE_RULE_JSON, "merchantId": None}], "total": 1}
+
+    rules = await client_with(responds(payload)).get_fee_rules()
+
+    assert rules[0].merchant_id is None
+
+
+@pytest.mark.parametrize(
+    ("name", "payload"),
+    [
+        ("not an envelope", {"rules": []}),
+        ("missing total", {"items": []}),
+        ("unknown fee type", {"items": [{**FEE_RULE_JSON, "feeType": "MYSTERY"}], "total": 1}),
+        ("missing field", {"items": [{k: v for k, v in FEE_RULE_JSON.items() if k != "currency"}], "total": 1}),
+        ("unexpected field", {"items": [{**FEE_RULE_JSON, "tier": "B"}], "total": 1}),
+    ],
+)
+async def test_a_malformed_fee_rule_response_maps_to_a_contract_error(
+    name: str, payload: dict[str, object]
+) -> None:
+    with pytest.raises(FinancialCoreContractError):
+        await client_with(responds(payload)).get_fee_rules()
+
+
+async def test_fee_rule_transport_failures_follow_the_established_semantics() -> None:
+    def refused(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    with pytest.raises(FinancialCoreUnavailable):
+        await client_with(refused).get_fee_rules()
+    with pytest.raises(FinancialCoreTimeout):
+        await client_with(slow).get_fee_rules()
+    with pytest.raises(FinancialCoreUnavailable):
+        await client_with(responds({}, status_code=503)).get_fee_rules()
+
+
+async def test_retrieving_fee_rules_reaches_no_conclusion() -> None:
+    """A matching amount is evidence, never a classification."""
+    payload = {"items": [FEE_RULE_JSON], "total": 1}
+
+    rules = await client_with(responds(payload)).get_fee_rules()
+
+    assert not hasattr(rules[0], "classification")
+    assert not hasattr(rules[0], "root_cause")
+    assert not hasattr(rules[0], "confidence")
+    assert "PROCESSOR_FEE" not in repr(rules)

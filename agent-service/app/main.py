@@ -5,10 +5,11 @@ by the Spring Boot financial core. It is not a system of record: the financial
 core remains authoritative for transactions and settlements, and this service
 never writes to them.
 
-Phase 4.4 consumes reconciliation exceptions from Kafka, records a PENDING
-investigation for each, and offers a controlled read-only interface for
-retrieving financial evidence. Nothing yet uses that interface automatically:
-no investigation runs, and no model is called.
+Phase 4.5 consumes reconciliation exceptions from Kafka, records a PENDING
+investigation for each, and offers controlled read-only ways to retrieve
+evidence: transactions, settlements and fee rules from the financial core, and
+excerpts from a local policy corpus. Nothing uses them automatically. No
+investigation runs, no cause is proposed, and no model is called.
 """
 
 import logging
@@ -26,6 +27,7 @@ from app.investigation_service import InvestigationService
 from app.investigations_api import router as investigations_router
 from app.kafka_consumer import ReconciliationExceptionConsumer
 from app.logging_config import configure_logging
+from app.policy_search import PolicySearch
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,9 @@ def create_app(
     configure_logging(settings.log_level)
     database = database or Database(settings)
     financial_core = financial_core or FinancialCoreClient(settings)
+    # Read once at startup: the corpus is small, changes rarely, and loading it
+    # per query would make results depend on filesystem timing.
+    policies = PolicySearch(settings.policy_corpus_path)
     investigations = InvestigationService(database)
     consumer = consumer or ReconciliationExceptionConsumer(settings, investigations)
 
@@ -105,7 +110,7 @@ def create_app(
     app = FastAPI(
         title="ReconAI Investigation Service",
         description=DESCRIPTION,
-        version="0.4.0",
+        version="0.5.0",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -113,6 +118,7 @@ def create_app(
     app.state.database = database
     app.state.investigations = investigations
     app.state.financial_core = financial_core
+    app.state.policies = policies
     app.include_router(health_router)
     app.include_router(investigations_router)
     return app

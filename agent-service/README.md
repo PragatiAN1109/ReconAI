@@ -10,15 +10,16 @@ read-only interfaces when those are built.
 
 > Deterministic systems detect. AI investigates. Humans authorize.
 
-## Phase 4.4 scope
+## Phase 4.5 scope
 
 The service consumes reconciliation exceptions from Kafka and records a `PENDING`
 investigation for each — exactly one per exception, however many times the event is
-delivered. It also offers a **controlled read-only interface** for retrieving financial
-evidence from the Financial Core.
+delivered. It also offers **controlled read-only evidence tools**: transactions,
+settlements and fee rules from the Financial Core, plus excerpts from a local policy
+corpus.
 
-Nothing calls that interface automatically yet. No investigation runs, and no model is
-involved. See [Not implemented yet](#not-implemented-yet).
+Nothing calls them automatically. No investigation runs, no cause is proposed, and no
+model is involved. See [Not implemented yet](#not-implemented-yet).
 
 ## Prerequisites
 
@@ -90,6 +91,7 @@ locally, so the service starts with nothing set.
 | `RECONAI_AGENT_DATABASE_URL` | `postgresql+asyncpg://reconai:reconai@localhost:55432/reconai` | database |
 | `RECONAI_AGENT_FINANCIAL_CORE_BASE_URL` | `http://localhost:8099` | Financial Core, for evidence |
 | `RECONAI_AGENT_FINANCIAL_CORE_TIMEOUT_SECONDS` | `5.0` | evidence request timeout |
+| `RECONAI_AGENT_POLICY_CORPUS_PATH` | `<repo>/policies` | policy corpus directory |
 
 The database port is **55432**, not 5432 — the Compose stack publishes PostgreSQL there
 so it does not collide with a local server. Keep it aligned with `RECONAI_POSTGRES_PORT`.
@@ -276,12 +278,28 @@ Investigation Service ──GET──▶ Financial Core API ──▶ typed evid
 |---|---|
 | `get_transaction(transaction_id)` | `GET /api/v1/transactions/{transactionId}` |
 | `get_settlements(transaction_id)` | `GET /api/v1/transactions/{transactionId}/settlements` |
+| `get_fee_rules(...)` | `GET /api/v1/fee-rules` |
 
 ```python
 async with FinancialCoreClient(settings) as core:
     transaction = await core.get_transaction("TX-10009")
     settlements = await core.get_settlements("TX-10009")
+    fee_rules = await core.get_fee_rules(
+        merchant_id="MERCHANT-PHASE43-DEMO",
+        processor="NORTHSTAR_PAYMENTS",
+        currency="USD",
+        active=True,
+    )
 ```
+
+`get_fee_rules` takes optional `merchant_id`, `processor`, `currency` and `active`
+filters; omitted ones are not sent. A merchant filter also returns rules that name no
+merchant, since those apply to every merchant on the processor. No matching rules is an
+empty list, not an error.
+
+**A fee rule is context, not a conclusion.** A rule whose amount equals a settlement
+difference is evidence that such a fee exists — not a finding that this transaction was
+charged it. Nothing in this service draws that inference.
 
 Both return typed models, never raw responses or dictionaries. Money is `Decimal` and
 never `float` — a binary float cannot hold 1247.50 exactly, and evidence rounded on the
@@ -325,6 +343,49 @@ investigation conclude something from an outage.
 
 Responses are validated strictly: an unexpected field is a `FinancialCoreContractError`,
 because both sides of this contract are owned in this repository and drift should surface.
+
+## Policy corpus
+
+Five concise Markdown documents in `policies/`, covering fees, settlement processing,
+reconciliation operations, currency conversion and exception handling.
+
+**They are synthetic.** Invented for demonstration, describing no real processor, bank,
+network or regulator. See `policies/README.md`.
+
+```python
+policies = PolicySearch(settings.policy_corpus_path)
+results = policies.search("NORTHSTAR_PAYMENTS cross-network settlement fee")
+```
+
+Each result carries the provenance needed to cite it:
+
+```
+[POL-FEE-001] Merchant Fee Schedule — §Cross-Network Settlement Fees  (score 1.5115)
+  "A cross-network settlement processing fee applies when a purchase is settled ..."
+```
+
+### Deterministic lexical search, not semantic search
+
+No embeddings, no vector store, no model, no external service. Term matching with a
+fixed scoring rule: how many of the query's distinct terms a section contains, weighted
+by frequency damped for length, with extra weight for terms in the heading. Ties break
+by document ID then position, so the same corpus and query always produce the same
+results in the same order — never dependent on filesystem enumeration.
+
+Matching is case-insensitive and punctuation-tolerant, and identifiers like
+`NORTHSTAR_PAYMENTS` stay whole rather than fragmenting. No match returns an empty list.
+
+This is a tool contract, not a retrieval engine. The implementation can be replaced
+without changing what callers see.
+
+### The filesystem boundary
+
+`PolicySearch` exposes exactly one public method: `search(query)`. There is **no**
+`read_file`, no directory listing, and no path or filename argument. The corpus
+directory is fixed at construction, only `*.md` files inside it are read, and a
+document without a `document_id` is skipped because nothing could cite it. A query is
+search terms and never a path — `../../etc/passwd` is just four terms that match
+nothing. Tests assert all of this.
 
 ### Verifying against a running Financial Core
 
@@ -512,12 +573,13 @@ and that is the end of it.
 `get_transaction` and `get_settlements` exist, but **nothing calls them automatically**.
 An investigation stays `PENDING`; there is no orchestrator.
 
-Absent by design: LLM and agent framework integration of any kind, agent reasoning, tool
-calling, the remaining evidence tools (`get_fee_rules`, `get_transaction_history`,
-`search_policy_documents`), investigation evidence persistence, recommendation
-generation and persistence, root-cause classification, confidence scoring, fee rules,
-RAG, embeddings, pgvector, approvals, audit workflow, authentication, a frontend,
-financial writes, and autonomous actions of any kind.
+Absent by design: LLM and agent framework integration of any kind, agent reasoning,
+tool calling, `get_transaction_history`, investigation evidence persistence,
+recommendation generation and persistence, **root-cause classification** (including
+`PROCESSOR_FEE`, which is not a deterministic exception type and is not concluded
+anywhere), confidence scoring, semantic search, embeddings, vector stores, pgvector,
+approvals, audit workflow, authentication, a frontend, financial writes, and autonomous
+actions of any kind.
 
 Also absent, and worth naming because they are the natural next questions:
 

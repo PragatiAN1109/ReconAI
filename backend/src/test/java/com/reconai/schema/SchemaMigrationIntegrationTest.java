@@ -38,23 +38,24 @@ class SchemaMigrationIntegrationTest extends PostgresIntegrationTest {
     }
 
     @Test
-    void flywayAppliesAllThreeSchemaMigrationsSuccessfully() {
+    void flywayAppliesEverySchemaMigrationSuccessfully() {
         List<String> applied = jdbc.queryForList(
                 "SELECT version FROM flyway_schema_history WHERE success = true ORDER BY installed_rank",
                 String.class);
 
-        assertThat(applied).containsExactly("1", "2", "3");
+        assertThat(applied).containsExactly("1", "2", "3", "4");
     }
 
     @Test
-    void migrationsCreateTheThreeFinancialCoreTables() {
+    void migrationsCreateTheFinancialCoreTables() {
         List<String> tables = jdbc.queryForList(
                 "SELECT table_name FROM information_schema.tables "
                         + "WHERE table_schema = 'public' AND table_type = 'BASE TABLE' "
                         + "AND table_name <> 'flyway_schema_history' ORDER BY table_name",
                 String.class);
 
-        assertThat(tables).containsExactly("reconciliation_exceptions", "settlements", "transactions");
+        assertThat(tables).containsExactly(
+                "fee_rules", "reconciliation_exceptions", "settlements", "transactions");
     }
 
     @Test

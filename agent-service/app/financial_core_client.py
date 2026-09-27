@@ -1,7 +1,7 @@
 """The controlled read-only interface to the Financial Core.
 
 This is the *only* way the Investigation Service reaches authoritative financial
-data. It is deliberately narrow: two named operations, both GET, no generic
+data. It is deliberately narrow: three named operations, all GET, no generic
 request method and no arbitrary-URL escape hatch. A future investigation agent
 gets this object's public methods as its allowlist, so anything added here
 becomes a capability the agent has.
@@ -18,7 +18,13 @@ import httpx
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.evidence_models import SettlementEvidence, TransactionEvidence, TransactionSettlements
+from app.evidence_models import (
+    FeeRuleEvidence,
+    FeeRuleList,
+    SettlementEvidence,
+    TransactionEvidence,
+    TransactionSettlements,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +63,11 @@ class FinancialCoreContractError(FinancialCoreError):
 class FinancialCoreClient:
     """Retrieves financial evidence over HTTP.
 
-    The public surface is exactly two operations:
+    The public surface is exactly three operations:
 
     * :meth:`get_transaction`
     * :meth:`get_settlements`
+    * :meth:`get_fee_rules`
 
     There is no ``request(method, path)``, no ``fetch_url`` and no write
     operation. That is the safety boundary, not an oversight: a generic method
@@ -153,9 +160,53 @@ class FinancialCoreClient:
         )
         return list(response.settlements)
 
+    async def get_fee_rules(
+        self,
+        *,
+        merchant_id: str | None = None,
+        processor: str | None = None,
+        currency: str | None = None,
+        active: bool | None = None,
+    ) -> list[FeeRuleEvidence]:
+        """Retrieve fee configuration matching the given filters.
+
+        Every filter is optional and omitted ones are not sent. A merchant
+        filter also returns rules that name no merchant, since those apply to
+        every merchant on the processor — the financial core decides that, not
+        this client.
+
+        Returns evidence only. A rule whose amount equals some settlement
+        difference is not a finding that the fee was charged; nothing here
+        draws that conclusion.
+
+        No matching rules is an empty list, not an error: "this processor has
+        no such fee" is a legitimate and useful answer.
+
+        :raises FinancialCoreUnavailable: the financial core could not be reached
+        :raises FinancialCoreTimeout: the financial core did not answer in time
+        :raises FinancialCoreContractError: the response did not match the contract
+        """
+        parameters: dict[str, str] = {}
+        if merchant_id is not None:
+            parameters["merchantId"] = merchant_id
+        if processor is not None:
+            parameters["processor"] = processor
+        if currency is not None:
+            parameters["currency"] = currency
+        if active is not None:
+            # Spring parses "true"/"false"; Python's str(bool) gives "True".
+            parameters["active"] = "true" if active else "false"
+
+        payload = await self._get(
+            "/api/v1/fee-rules", resource="Fee rules", parameters=parameters
+        )
+        return list(self._validate(payload, FeeRuleList, resource="Fee rules").items)
+
     # -- internals ---------------------------------------------------------
 
-    async def _get(self, path: str, *, resource: str) -> object:
+    async def _get(
+        self, path: str, *, resource: str, parameters: dict[str, str] | None = None
+    ) -> object:
         """Perform one GET and turn transport and status failures into domain errors.
 
         Private on purpose. Exposing it would be the generic HTTP tool this
@@ -165,7 +216,7 @@ class FinancialCoreClient:
             raise FinancialCoreUnavailable("Financial Core client is not open")
 
         try:
-            response = await self._client.get(path)
+            response = await self._client.get(path, params=parameters)
         except httpx.TimeoutException as error:
             raise FinancialCoreTimeout(
                 f"{resource} could not be retrieved: the Financial Core timed out "

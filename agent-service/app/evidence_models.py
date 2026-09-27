@@ -48,6 +48,16 @@ class SettlementStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class FeeType(StrEnum):
+    """Mirrors ``com.reconai.feerule.FeeType``."""
+
+    FIXED = "FIXED"
+    PERCENTAGE = "PERCENTAGE"
+    NETWORK = "NETWORK"
+    CROSS_BORDER = "CROSS_BORDER"
+    PROCESSING = "PROCESSING"
+
+
 class TransactionEvidence(BaseModel):
     """What the financial system expected to settle.
 
@@ -82,6 +92,39 @@ class SettlementEvidence(BaseModel):
     currency: str
     status: SettlementStatus
     settlement_timestamp: AwareDatetime = Field(alias="settlementTimestamp")
+
+
+class FeeRuleEvidence(BaseModel):
+    """A fee that applies to a processor, optionally narrowed to one merchant.
+
+    This is context, not a conclusion. A rule whose amount happens to equal a
+    settlement difference is evidence that such a fee exists — not a finding
+    that this transaction was charged it. Drawing that inference is
+    investigation's job and needs more than a matching number.
+
+    ``merchant_id`` is absent when the rule applies to every merchant on the
+    processor.
+    """
+
+    model_config = _STRICT
+
+    rule_id: str = Field(alias="ruleId")
+    merchant_id: str | None = Field(default=None, alias="merchantId")
+    processor: str
+    fee_type: FeeType = Field(alias="feeType")
+    fee_amount: Decimal = Field(alias="feeAmount")
+    currency: str
+    description: str
+    active: bool
+
+
+class FeeRuleList(BaseModel):
+    """The financial core's fee rule list envelope."""
+
+    model_config = _STRICT
+
+    items: list[FeeRuleEvidence]
+    total: int
 
 
 class TransactionSettlements(BaseModel):

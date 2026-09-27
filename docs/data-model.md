@@ -534,17 +534,28 @@ fee_rules
 |---|---|---:|---|
 | id | UUID | Yes | Internal primary key |
 | rule_id | VARCHAR(50) | Yes | Unique business ID, e.g. `FR-14` |
-| merchant_id | VARCHAR(50) | No | Merchant-specific rule |
+| merchant_id | VARCHAR(50) | No | Merchant-specific rule; null applies to all merchants on the processor |
 | processor | VARCHAR(100) | Yes | Applicable processor |
 | fee_type | VARCHAR(50) | Yes | Type of fee |
-| fee_amount | NUMERIC(19,4) | No | Fixed fee |
-| fee_percentage | NUMERIC(8,5) | No | Percentage fee |
-| currency | VARCHAR(3) | No | Currency for fixed fee |
+| fee_amount | NUMERIC(19,4) | Yes | Fixed fee |
+| currency | VARCHAR(3) | Yes | Currency of the fee |
 | description | TEXT | Yes | Rule description |
-| effective_from | TIMESTAMPTZ | Yes | Effective start |
-| effective_to | TIMESTAMPTZ | No | Optional expiration |
 | active | BOOLEAN | Yes | Whether rule is active |
 | created_at | TIMESTAMPTZ | Yes | Creation time |
+
+### Fields not implemented
+
+`fee_percentage`, `effective_from` and `effective_to` are deliberately absent from the
+implemented schema.
+
+V1 models fixed-amount fees only, which is why `fee_amount` and `currency` are required
+here where a percentage-capable model would make both optional. Adding percentage rules
+later means relaxing those two columns and adding `fee_percentage`.
+
+Temporal validity is represented by `active` alone. Effective-date windows imply
+point-in-time rule resolution — deciding which rule applied on the date a settlement
+occurred — which is real logic with real edge cases and no current use. `active`
+answers the only question asked today: is this fee currently charged.
 
 ## FeeType
 
@@ -555,6 +566,12 @@ NETWORK
 CROSS_BORDER
 PROCESSING
 ```
+
+A fee rule is **evidence**, not a verdict. It records that a fee of this shape applies
+to a processor. It never records that a particular transaction was charged one:
+establishing that requires the transaction, its settlements and a judgement, none of
+which live here. Deterministic reconciliation does not read this table, and a
+difference that happens to equal a fee amount is still an `AMOUNT_MISMATCH`.
 
 This table allows:
 

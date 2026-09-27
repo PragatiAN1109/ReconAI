@@ -133,7 +133,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
                 .sorted()
                 .collect(Collectors.joining("; "));
 
-        return asResponseEntity(ErrorCode.VALIDATION_ERROR,
+        return asResponseEntity(status, ErrorCode.VALIDATION_ERROR,
                 message.isBlank() ? "Request is invalid." : message, request);
     }
 
@@ -147,7 +147,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
             org.springframework.http.converter.HttpMessageNotReadableException ex,
             HttpHeaders headers, HttpStatusCode status, WebRequest request) {
 
-        return asResponseEntity(ErrorCode.VALIDATION_ERROR, describeUnreadableBody(ex), request);
+        return asResponseEntity(status, ErrorCode.VALIDATION_ERROR, describeUnreadableBody(ex), request);
     }
 
     /**
@@ -163,7 +163,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         if (errorCode == ErrorCode.INTERNAL_ERROR) {
             log.error("Unhandled MVC exception [correlationId={}]", correlationId(request), ex);
         }
-        return asResponseEntity(errorCode, messageFor(errorCode), request);
+        return asResponseEntity(statusCode, errorCode, messageFor(errorCode), request);
     }
 
     // -----------------------------------------------------------------
@@ -194,10 +194,12 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     }
 
     /**
-     * Maps an HTTP status onto a contract category. The contract's category list is
-     * closed, so statuses without a dedicated category — 405 and 415, for instance —
-     * are reported as VALIDATION_ERROR, which is accurate in that the request as sent
-     * cannot be accepted.
+     * Maps an HTTP status onto a contract category.
+     *
+     * <p>This chooses the category only. The response keeps the status Spring decided
+     * on, so a 405 stays a 405 even though the closed category list has nothing better
+     * than VALIDATION_ERROR to call it — accurate in that the request as sent cannot be
+     * accepted.
      */
     private ErrorCode errorCodeFor(HttpStatusCode statusCode) {
         return switch (statusCode.value()) {
@@ -218,20 +220,35 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         };
     }
 
+    /** Renders an application exception at the status its category defines. */
     private ResponseEntity<ApiError> respond(ErrorCode errorCode, String message,
                                              HttpServletRequest request) {
         return ResponseEntity.status(errorCode.httpStatus())
-                .body(build(errorCode, message, request.getRequestURI(), correlationId(request)));
+                .body(build(errorCode.httpStatus(), errorCode, message,
+                        request.getRequestURI(), correlationId(request)));
     }
 
-    private ResponseEntity<Object> asResponseEntity(ErrorCode errorCode, String message,
-                                                    WebRequest request) {
-        return ResponseEntity.status(errorCode.httpStatus())
-                .body(build(errorCode, message, path(request), correlationId(request)));
+    /**
+     * Renders a Spring MVC exception at the status Spring itself decided on.
+     *
+     * <p>The status is a parameter rather than being derived from the category. The
+     * contract's categories are closed and do not cover every HTTP status, so deriving
+     * the status from the category collapsed distinct outcomes onto one code: a request
+     * to a resource that exists but does not support the method is 405, and reporting it
+     * as 400 told the caller their request was malformed when it was not.
+     *
+     * <p>The category still describes the failure; the status still describes what HTTP
+     * says happened. The two are related but not interchangeable.
+     */
+    private ResponseEntity<Object> asResponseEntity(HttpStatusCode statusCode, ErrorCode errorCode,
+                                                    String message, WebRequest request) {
+        return ResponseEntity.status(statusCode)
+                .body(build(statusCode, errorCode, message, path(request), correlationId(request)));
     }
 
-    private ApiError build(ErrorCode errorCode, String message, String path, String correlationId) {
-        return new ApiError(Instant.now(clock), errorCode.httpStatus().value(), errorCode,
+    private ApiError build(HttpStatusCode statusCode, ErrorCode errorCode, String message,
+                           String path, String correlationId) {
+        return new ApiError(Instant.now(clock), statusCode.value(), errorCode,
                 message, path, correlationId);
     }
 
