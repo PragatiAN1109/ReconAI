@@ -5,9 +5,10 @@ by the Spring Boot financial core. It is not a system of record: the financial
 core remains authoritative for transactions and settlements, and this service
 never writes to them.
 
-Phase 4.3 consumes reconciliation exceptions from Kafka, validates them, and
-records a PENDING investigation for each. It stops there: nothing is
-investigated, no evidence is fetched, and no model is called.
+Phase 4.4 consumes reconciliation exceptions from Kafka, records a PENDING
+investigation for each, and offers a controlled read-only interface for
+retrieving financial evidence. Nothing yet uses that interface automatically:
+no investigation runs, and no model is called.
 """
 
 import logging
@@ -19,6 +20,7 @@ from fastapi import FastAPI
 
 from app.config import Settings
 from app.database import Database
+from app.financial_core_client import FinancialCoreClient
 from app.health import router as health_router
 from app.investigation_service import InvestigationService
 from app.investigations_api import router as investigations_router
@@ -37,6 +39,7 @@ def create_app(
     settings: Settings | None = None,
     consumer: ReconciliationExceptionConsumer | None = None,
     database: Database | None = None,
+    financial_core: FinancialCoreClient | None = None,
 ) -> FastAPI:
     """Build the application.
 
@@ -47,6 +50,7 @@ def create_app(
     settings = settings or Settings()
     configure_logging(settings.log_level)
     database = database or Database(settings)
+    financial_core = financial_core or FinancialCoreClient(settings)
     investigations = InvestigationService(database)
     consumer = consumer or ReconciliationExceptionConsumer(settings, investigations)
 
@@ -70,6 +74,10 @@ def create_app(
                 settings.redacted_database_url,
             )
 
+        # Opening the pool does not contact the financial core, so there is
+        # nothing here that can fail on its account.
+        await financial_core.open()
+
         try:
             await consumer.start()
         except Exception:
@@ -90,19 +98,21 @@ def create_app(
             # Reverse order: stop consuming before closing the pool the
             # consumer writes through.
             await consumer.stop()
+            await financial_core.close()
             await database.disconnect()
             logger.info("Investigation service stopped [service=%s]", settings.service_name)
 
     app = FastAPI(
         title="ReconAI Investigation Service",
         description=DESCRIPTION,
-        version="0.3.0",
+        version="0.4.0",
         lifespan=lifespan,
     )
     app.state.settings = settings
     app.state.consumer = consumer
     app.state.database = database
     app.state.investigations = investigations
+    app.state.financial_core = financial_core
     app.include_router(health_router)
     app.include_router(investigations_router)
     return app

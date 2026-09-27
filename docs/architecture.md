@@ -272,7 +272,9 @@ Investigation persisted (PENDING)
 
 The Python service consumes the topic under the fixed group `reconai-investigation-service`, with `auto.offset.reset=latest` and manual commits after each record. Delivery is at-least-once, so investigation handling must be idempotent by `exceptionId` once it exists. A validated event becomes a `PENDING` investigation, at most one per `exceptionId` — enforced by a unique constraint rather than an application check, since duplicate deliveries can arrive concurrently. A record's offset is committed only once it has been recorded or judged permanently unusable; a valid event that cannot be stored leaves its offset uncommitted so it is redelivered rather than lost. Nothing beyond that happens: no evidence is fetched and no model is called.
 
-The investigation service owns the `investigation` schema and writes nowhere else. It never reads or writes `transactions`, `settlements` or `reconciliation_exceptions`, and holds no foreign keys into them; `exceptionId` and `transactionId` are references to be resolved through the financial core's API. See `agent-service/README.md` for offset, readiness and migration detail.
+The investigation service owns the `investigation` schema and writes nowhere else. It never reads or writes `transactions`, `settlements` or `reconciliation_exceptions`, and holds no foreign keys into them; `exceptionId` and `transactionId` are resolved through the financial core's API instead.
+
+That resolution is implemented as a deliberately narrow read-only client exposing exactly two operations — `get_transaction` and `get_settlements`, against `GET /api/v1/transactions/{id}` and `GET /api/v1/transactions/{id}/settlements`. There is no generic request method and no write operation, because these methods are the allowlist a future investigation agent receives: anything added here becomes a capability that agent has. Monetary evidence is carried as decimal and never as floating point. Nothing invokes these tools automatically yet. See `agent-service/README.md` for offset, readiness, migration and evidence detail.
 
 ---
 

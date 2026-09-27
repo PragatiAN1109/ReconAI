@@ -10,12 +10,15 @@ read-only interfaces when those are built.
 
 > Deterministic systems detect. AI investigates. Humans authorize.
 
-## Phase 4.3 scope
+## Phase 4.4 scope
 
-The service consumes reconciliation exceptions from Kafka, validates them, and records a
-`PENDING` investigation for each — exactly one per exception, however many times the
-event is delivered. **It stops there**: nothing is investigated, no evidence is fetched,
-no model is called. See [Not implemented yet](#not-implemented-yet).
+The service consumes reconciliation exceptions from Kafka and records a `PENDING`
+investigation for each — exactly one per exception, however many times the event is
+delivered. It also offers a **controlled read-only interface** for retrieving financial
+evidence from the Financial Core.
+
+Nothing calls that interface automatically yet. No investigation runs, and no model is
+involved. See [Not implemented yet](#not-implemented-yet).
 
 ## Prerequisites
 
@@ -85,6 +88,8 @@ locally, so the service starts with nothing set.
 | `RECONAI_AGENT_KAFKA_EXCEPTIONS_TOPIC` | `reconciliation.exceptions` | topic to consume |
 | `RECONAI_AGENT_KAFKA_CONSUMER_GROUP` | `reconai-investigation-service` | consumer group |
 | `RECONAI_AGENT_DATABASE_URL` | `postgresql+asyncpg://reconai:reconai@localhost:55432/reconai` | database |
+| `RECONAI_AGENT_FINANCIAL_CORE_BASE_URL` | `http://localhost:8099` | Financial Core, for evidence |
+| `RECONAI_AGENT_FINANCIAL_CORE_TIMEOUT_SECONDS` | `5.0` | evidence request timeout |
 
 The database port is **55432**, not 5432 — the Compose stack publishes PostgreSQL there
 so it does not collide with a local server. Keep it aligned with `RECONAI_POSTGRES_PORT`.
@@ -258,6 +263,90 @@ cannot drift onto different databases. Tables are never created from ORM metadat
 startup: a service that creates its own schema leaves no reviewable history of how it got
 that way.
 
+## Evidence tools
+
+Investigating a discrepancy needs the authoritative records behind it. This service does
+not hold them and must not read the financial core's tables, so it asks over HTTP:
+
+```
+Investigation Service ──GET──▶ Financial Core API ──▶ typed evidence
+```
+
+| Tool | Financial Core endpoint |
+|---|---|
+| `get_transaction(transaction_id)` | `GET /api/v1/transactions/{transactionId}` |
+| `get_settlements(transaction_id)` | `GET /api/v1/transactions/{transactionId}/settlements` |
+
+```python
+async with FinancialCoreClient(settings) as core:
+    transaction = await core.get_transaction("TX-10009")
+    settlements = await core.get_settlements("TX-10009")
+```
+
+Both return typed models, never raw responses or dictionaries. Money is `Decimal` and
+never `float` — a binary float cannot hold 1247.50 exactly, and evidence rounded on the
+way in is not evidence. Timestamps stay timezone-aware.
+
+`get_settlements` is **plural and returns a list**, possibly empty. A transaction may have
+none, one, or several, and which of those it is decides between `MISSING_SETTLEMENT`,
+`DUPLICATE_SETTLEMENT` and everything else.
+
+### Read-only, by construction
+
+`FinancialCoreClient` exposes exactly four public methods: `get_transaction`,
+`get_settlements`, `open` and `close`. There is **no** `request(method, path)`, no
+`fetch_url`, and no write operation of any kind.
+
+This is the point of the design, not an omission. These methods are the allowlist a
+future investigation agent receives, so anything added here becomes a capability that
+agent has. A generic method would hand it the whole API, including the endpoints that
+create and reconcile financial records. Tests assert the public surface stays exactly
+these four and that only `GET` requests are ever issued.
+
+The service also holds **no database access to financial records**. `transactions`,
+`settlements` and `reconciliation_exceptions` are reachable only through the endpoints
+above.
+
+### When evidence cannot be retrieved
+
+Four distinct errors, because an investigation has to tell them apart:
+
+| Error | Meaning |
+|---|---|
+| `FinancialCoreNotFound` | the financial core says the record does not exist |
+| `FinancialCoreUnavailable` | unreachable, or answered with a server error |
+| `FinancialCoreTimeout` | did not answer within the configured timeout |
+| `FinancialCoreContractError` | the response did not match the expected contract |
+
+All inherit `FinancialCoreError`. A missing transaction **raises** rather than returning
+`None`, and unknown-transaction **never** degrades into an empty settlement list. An
+absence that was never verified is not a finding, and softening these would let an
+investigation conclude something from an outage.
+
+Responses are validated strictly: an unexpected field is a `FinancialCoreContractError`,
+because both sides of this contract are owned in this repository and drift should surface.
+
+### Verifying against a running Financial Core
+
+```bash
+python - <<'EOF'
+import asyncio
+from app.config import Settings
+from app.financial_core_client import FinancialCoreClient
+
+async def main():
+    async with FinancialCoreClient(Settings()) as core:
+        print(await core.get_transaction("TX-10009"))
+        print(await core.get_settlements("TX-10009"))
+
+asyncio.run(main())
+EOF
+```
+
+Inside a container, `localhost:8099` is the container itself. Point
+`RECONAI_AGENT_FINANCIAL_CORE_BASE_URL` at `host.docker.internal:8099` or a Compose
+service name instead; the default assumes host development.
+
 ## Endpoints
 
 ### `GET /health` — liveness
@@ -309,6 +398,12 @@ the server behind it is gone, and that is cheap enough to do per call.
 Neither dependency being down stops the process from starting. Liveness stays up and
 readiness reports `NOT_READY`, so an orchestrator routes away from the instance instead
 of watching it crash-loop through an outage it cannot fix.
+
+The **Financial Core is deliberately not part of readiness.** Kafka and PostgreSQL are
+needed continuously to record investigations; the Financial Core is needed only when
+evidence is actually retrieved. A brief outage there should make that retrieval fail
+explicitly — with one of the errors above — rather than take an otherwise healthy
+instance out of rotation and invite restarts that cannot fix an upstream problem.
 
 ## Local startup order
 
@@ -414,12 +509,15 @@ alongside the stack rather than run from a shell.
 Kafka consumption now works. **AI investigation does not.** A validated event is logged
 and that is the end of it.
 
+`get_transaction` and `get_settlements` exist, but **nothing calls them automatically**.
+An investigation stays `PENDING`; there is no orchestrator.
+
 Absent by design: LLM and agent framework integration of any kind, agent reasoning, tool
-calling, the financial-core tools (`get_transaction`, `get_settlements`, `get_fee_rules`,
-`get_transaction_history`, `search_policy_documents`), an HTTP client to the financial
-core, any database access, investigation and recommendation persistence, fee rules, RAG,
-embeddings, pgvector, approvals, audit workflow, authentication, a frontend, and
-autonomous actions of any kind.
+calling, the remaining evidence tools (`get_fee_rules`, `get_transaction_history`,
+`search_policy_documents`), investigation evidence persistence, recommendation
+generation and persistence, root-cause classification, confidence scoring, fee rules,
+RAG, embeddings, pgvector, approvals, audit workflow, authentication, a frontend,
+financial writes, and autonomous actions of any kind.
 
 Also absent, and worth naming because they are the natural next questions:
 

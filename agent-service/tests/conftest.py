@@ -71,6 +71,23 @@ class FakeDatabase:
         return self._connected and self.healthy
 
 
+class FakeFinancialCore:
+    """Stands in for the Financial Core client at the lifecycle boundary."""
+
+    def __init__(self) -> None:
+        self.open_calls = 0
+        self.close_calls = 0
+        self.is_open = False
+
+    async def open(self) -> None:
+        self.open_calls += 1
+        self.is_open = True
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self.is_open = False
+
+
 @pytest.fixture
 def settings() -> Settings:
     """Explicit settings, so a stray environment variable cannot change a result."""
@@ -94,7 +111,18 @@ def database() -> FakeDatabase:
 
 
 @pytest.fixture
-def client(settings: Settings, consumer: FakeConsumer, database: FakeDatabase) -> TestClient:
+def financial_core() -> FakeFinancialCore:
+    return FakeFinancialCore()
+
+
+@pytest.fixture
+def client(
+    settings: Settings,
+    consumer: FakeConsumer,
+    database: FakeDatabase,
+    financial_core: FakeFinancialCore,
+) -> TestClient:
     """A client whose lifespan runs, so startup and shutdown are exercised too."""
-    with TestClient(create_app(settings, consumer=consumer, database=database)) as test_client:
+    app = create_app(settings, consumer=consumer, database=database, financial_core=financial_core)
+    with TestClient(app) as test_client:
         yield test_client

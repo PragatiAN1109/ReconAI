@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
-from tests.conftest import FakeConsumer, FakeDatabase
+from tests.conftest import FakeConsumer, FakeDatabase, FakeFinancialCore
 
 
 def test_the_consumer_starts_with_the_application(settings: Settings) -> None:
@@ -187,3 +187,63 @@ def test_ready_reports_not_ready_when_the_database_stops_answering(settings: Set
 
     assert response.status_code == 503
     assert response.json()["database"] == "DOWN"
+
+
+# ---------------------------------------------------------------------------
+# The Financial Core client is pooled, so it has a lifecycle too
+# ---------------------------------------------------------------------------
+
+
+def test_the_financial_core_client_opens_with_the_application(settings: Settings) -> None:
+    financial_core = FakeFinancialCore()
+
+    with TestClient(
+        create_app(
+            settings,
+            consumer=FakeConsumer(),
+            database=FakeDatabase(),
+            financial_core=financial_core,
+        )
+    ):
+        assert financial_core.open_calls == 1
+        assert financial_core.is_open
+
+
+def test_the_financial_core_client_closes_on_shutdown(settings: Settings) -> None:
+    financial_core = FakeFinancialCore()
+
+    with TestClient(
+        create_app(
+            settings,
+            consumer=FakeConsumer(),
+            database=FakeDatabase(),
+            financial_core=financial_core,
+        )
+    ):
+        pass
+
+    assert financial_core.close_calls == 1
+    assert not financial_core.is_open
+
+
+def test_readiness_ignores_the_financial_core(settings: Settings) -> None:
+    """A downstream evidence source must not decide whether this service is ready.
+
+    Kafka and the database are needed continuously to record investigations.
+    The Financial Core is needed only when evidence is retrieved, so an outage
+    there should make that retrieval fail explicitly rather than take the whole
+    instance out of rotation and invite restarts it cannot fix.
+    """
+    with TestClient(
+        create_app(
+            settings,
+            consumer=FakeConsumer(),
+            database=FakeDatabase(),
+            financial_core=FakeFinancialCore(),
+        )
+    ) as client:
+        response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert set(response.json()) == {"status", "service", "kafka_consumer", "database"}
+    assert "financial_core" not in response.json()

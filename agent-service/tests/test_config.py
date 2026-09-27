@@ -109,3 +109,38 @@ def test_kafka_settings_can_be_overridden_by_environment(
 def test_the_consumer_group_is_fixed_rather_than_generated() -> None:
     """A generated group id would replay or duplicate work on every restart."""
     assert Settings(_env_file=None).kafka_consumer_group == Settings(_env_file=None).kafka_consumer_group
+
+
+# ---------------------------------------------------------------------------
+# Financial Core configuration
+# ---------------------------------------------------------------------------
+
+
+def test_financial_core_defaults_target_the_local_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("FINANCIAL_CORE_BASE_URL", "FINANCIAL_CORE_TIMEOUT_SECONDS"):
+        monkeypatch.delenv(f"RECONAI_AGENT_{name}", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.financial_core_base_url == "http://localhost:8099"
+    assert settings.financial_core_timeout_seconds == 5.0
+
+
+def test_the_financial_core_base_url_can_be_overridden(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A container cannot reach the host's localhost; it needs a different address."""
+    monkeypatch.setenv("RECONAI_AGENT_FINANCIAL_CORE_BASE_URL", "http://host.docker.internal:8099")
+    monkeypatch.setenv("RECONAI_AGENT_FINANCIAL_CORE_TIMEOUT_SECONDS", "2.5")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.financial_core_base_url == "http://host.docker.internal:8099"
+    assert settings.financial_core_timeout_seconds == 2.5
+
+
+def test_an_unusable_timeout_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, financial_core_timeout_seconds=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, financial_core_timeout_seconds=-1)
