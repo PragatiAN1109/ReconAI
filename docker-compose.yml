@@ -1,21 +1,18 @@
-# Minimum local infrastructure for the ReconAI financial core.
+# The full ReconAI stack.
 #
-# PostgreSQL holds the authoritative financial records. Kafka carries newly detected
-# reconciliation exceptions to a future investigation service.
+#   docker compose up --build
 #
-# The backend itself is not containerised here: it is run from backend/ with Maven
-# against these two services.
+# Five services, no locally installed Java, Python, Node, PostgreSQL or Kafka
+# required. Browse the console at http://localhost:3000.
 #
-#   docker compose up -d
-#   cd backend && mvn spring-boot:run
+# Inside the network services address each other by name — postgres:5432,
+# kafka:29092, financial-core:8080, investigation-service:8000. The published
+# host ports exist for debugging and for the existing local workflows; nothing
+# inside a container uses them.
 #
-# Host ports are overridable because a machine with PostgreSQL already installed
-# normally holds 127.0.0.1:5432. Docker would still bind *:5432 and start cleanly, but
-# the backend would silently connect to the local server instead of this container. To
-# avoid that, publish elsewhere and point the backend at it:
-#
-#   RECONAI_POSTGRES_PORT=55432 docker compose up -d
-#   RECONAI_DB_URL=jdbc:postgresql://localhost:55432/reconai mvn spring-boot:run
+# ⚠️  `docker compose down -v` DELETES the PostgreSQL volume and everything in
+#     it, including recorded investigations and audit history. To stop the stack
+#     and keep the data, use `docker compose down` (no -v) or `stop`.
 
 services:
   postgres:
@@ -26,6 +23,9 @@ services:
       POSTGRES_USER: reconai
       POSTGRES_PASSWORD: reconai
     ports:
+      # 55432, not 5432: a developer machine commonly already runs PostgreSQL on
+      # the default port. Docker would bind and start cleanly either way, but the
+      # services would then silently talk to the wrong server.
       - "${RECONAI_POSTGRES_PORT:-55432}:5432"
     volumes:
       - reconai-postgres-data:/var/lib/postgresql/data
@@ -45,10 +45,20 @@ services:
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:${RECONAI_KAFKA_PORT:-9092}
+      # Two client listeners, which a containerised stack genuinely requires.
+      #
+      # A Kafka client connects once, then reconnects to whatever address the
+      # broker advertises. With a single listener advertising localhost:9092, a
+      # container that reached kafka:9092 would be told to reconnect to
+      # "localhost" — itself — and fail with no useful error.
+      #
+      # So: PLAINTEXT advertises kafka:29092 for clients inside the network, and
+      # PLAINTEXT_HOST advertises localhost:9092 for clients on the host. Same
+      # broker, same topics, same data; two routes to it.
+      KAFKA_LISTENERS: PLAINTEXT://:29092,PLAINTEXT_HOST://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:${RECONAI_KAFKA_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       # Single node, so one replica is all that is available.
@@ -58,10 +68,117 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 >/dev/null 2>&1"]
       interval: 10s
       timeout: 10s
       retries: 10
 
+  financial-core:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: reconai-financial-core
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      # Service names, never localhost: inside a container localhost is the
+      # container itself.
+      RECONAI_DB_URL: jdbc:postgresql://postgres:5432/reconai
+      RECONAI_DB_USERNAME: reconai
+      RECONAI_DB_PASSWORD: reconai
+      RECONAI_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      RECONAI_PORT: 8080
+      # The dev profile adds classpath:db/seed to the Flyway locations, which is
+      # what supplies the demo fee rules (FR-14 and friends) the investigation
+      # demo depends on. Seed semantics are unchanged; this only selects them.
+      SPRING_PROFILES_ACTIVE: dev
+    ports:
+      # Host 8099 preserved: the existing local workflow, the agent service's
+      # default base URL and backend/README.md all use it.
+      - "${RECONAI_CORE_PORT:-8099}:8080"
+    healthcheck:
+      # The application exposes no Actuator endpoint, so this uses a real
+      # read-only API endpoint instead. It answers only once Flyway has migrated
+      # and the context is up, which is what "healthy" needs to mean here.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/api/v1/exceptions >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  investigation-service:
+    build:
+      # Repository root, not agent-service/: the service reads the policy corpus
+      # at policies/, which sits outside its own directory. See the Dockerfile.
+      context: .
+      dockerfile: agent-service/Dockerfile
+    container_name: reconai-investigation-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      financial-core:
+        # Evidence retrieval calls the Financial Core, so waiting for it to be
+        # genuinely serving avoids a first investigation failing on a dependency
+        # that was merely starting.
+        condition: service_healthy
+    environment:
+      RECONAI_AGENT_DATABASE_URL: postgresql+asyncpg://reconai:reconai@postgres:5432/reconai
+      RECONAI_AGENT_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      RECONAI_AGENT_FINANCIAL_CORE_BASE_URL: http://financial-core:8080
+      RECONAI_AGENT_HOST: 0.0.0.0
+      RECONAI_AGENT_PORT: 8000
+      RECONAI_AGENT_ENVIRONMENT: local
+      # Anthropic stays optional and defaults to off. Both values come from the
+      # host environment or an uncommitted .env file; neither is written here,
+      # and no key is ever baked into an image. With the provider unset the
+      # service runs normally and the run endpoint reports 503.
+      RECONAI_AGENT_LLM_PROVIDER: "${RECONAI_AGENT_LLM_PROVIDER:-none}"
+      RECONAI_AGENT_LLM_API_KEY: "${RECONAI_AGENT_LLM_API_KEY:-}"
+      RECONAI_AGENT_LLM_MODEL: "${RECONAI_AGENT_LLM_MODEL:-claude-sonnet-5}"
+    ports:
+      - "${RECONAI_AGENT_HOST_PORT:-8000}:8000"
+    healthcheck:
+      # /ready, not /health: readiness reports 503 unless both Kafka and the
+      # database are actually usable, which is the condition the frontend and
+      # any dependent service care about. python is already in the image, so no
+      # extra package is installed for this.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/ready', timeout=4).status==200 else 1)\" || exit 1"]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: reconai-frontend
+    depends_on:
+      # Not service_healthy: nginx should come up and serve the console even if a
+      # backend is still starting. The UI already degrades per-section when a
+      # service is unreachable, and blocking the whole console on a backend would
+      # replace a partial page with no page.
+      - financial-core
+      - investigation-service
+    ports:
+      - "${RECONAI_FRONTEND_PORT:-3000}:80"
+    healthcheck:
+      # 127.0.0.1, not localhost: inside the container localhost resolves to ::1
+      # first, and nginx here listens on IPv4 only, so the probe would be
+      # refused while the service was serving perfectly well from the host.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1/ -o /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
 volumes:
+  # Holds the financial records, the investigation schema, recorded
+  # recommendations and the audit trail. Removing it (docker compose down -v)
+  # destroys all of that.
   reconai-postgres-data:

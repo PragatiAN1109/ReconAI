@@ -1,0 +1,35 @@
+# Applies to builds using the repository root as context (the Investigation
+# Service). Keeps the context small and keeps local state out of images.
+
+.git/
+.gitignore
+.claude/
+
+# Build outputs and local environments
+**/target/
+**/node_modules/
+**/dist/
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.tsbuildinfo
+
+# Never bake credentials into an image.
+**/.env
+**/.env.*
+!**/.env.example
+
+# Not needed at runtime: tests, evaluation harness, generated reports, other
+# services' sources, and documentation.
+agent-service/tests/
+agent-service/evals/
+agent-service/eval-results/
+backend/
+frontend/
+docs/
+*.md
+!agent-service/README.md
