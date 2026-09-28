@@ -57,3 +57,6 @@ data/
 
 # Claude/local AI tooling
 .claude/
+# Generated evaluation results. Committing metrics invites presenting a
+# favourable run as a standing claim.
+eval-results/
