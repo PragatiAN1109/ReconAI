@@ -6,7 +6,7 @@ This document defines the V1 API boundaries between:
 
 - the React Operations Console;
 - the Spring Boot Financial Core;
-- the Python Investigation Agent Service; and
+- the Python Investigation Service; and
 - internal agent tools.
 
 The API design follows the core ReconAI principle:
@@ -48,7 +48,7 @@ Base path:
 
 ---
 
-## Investigation Agent Service
+## Investigation Service
 
 ```text
 Technology:
@@ -1129,7 +1129,9 @@ persisted or exposed anywhere in this system.
 # 22. Dashboard API — not implemented
 
 **This endpoint does not exist** in either service. It is planned for the
-Operations Console, which is itself not yet built.
+Operations Console. The console is built and deployed, but it derives its
+counts client-side from the investigation list rather than calling an
+aggregation endpoint, so this endpoint has not been needed.
 
 To avoid forcing the frontend to calculate operational statistics from raw records:
 

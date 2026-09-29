@@ -1036,8 +1036,9 @@ The backend lifecycle is complete: an exception detected by the financial core b
 investigation, is investigated, is stored, is routed by policy, is decided by a human, and
 is auditable throughout.
 
-**There is no frontend.** The React Operations Console that will call these endpoints is
-the next phase. The endpoints exist and are tested; nothing renders them.
+The React Operations Console that calls these endpoints is implemented in
+`frontend/` and deployed. What remains absent from *this service* is listed
+below.
 
 Absent by design:
 
@@ -1060,7 +1061,6 @@ Absent by design:
 - **Atomic database and Kafka commits.** They are separate transactions; idempotency
   covers the gap rather than closing it. Delivery is at-least-once and is not claimed to
   be more.
-- **Deployment.** The service is not in the root `docker-compose.yml`.
 - `get_transaction_history`, semantic search, embeddings, vector stores, pgvector, and
   multiple agents.
 
@@ -1070,10 +1070,10 @@ Java enum, the Python enum, and a PostgreSQL `CHECK` constraint on each side.
 
 ### A note on the provider
 
-⚠️ The Anthropic adapter has been verified structurally against the installed SDK with
-constructed response objects, but **not against a live API** — no credentials were
-available. Treat the first real call as a verification step for latency, auth and
-rate-limit behaviour rather than for shape.
+The Anthropic adapter has been exercised against the live API in the deployed
+environment, where it produced the escalated `PROCESSOR_FEE` recommendation shown in the
+root `README.md`. Its latency, rate-limit and retry behaviour under sustained load has
+not been characterised.
 
 Every test runs against a scripted `FakeModel`. None calls a provider, and none requires
 an API key.

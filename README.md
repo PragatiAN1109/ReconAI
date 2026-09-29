@@ -123,6 +123,7 @@ Every cited identifier is checked against evidence actually returned by controll
 The investigation lifecycle is recorded independently of the model output, including when investigation began, when the AI result was generated, and why the deterministic guardrail escalated the case.
 
 ![ReconAI append-only investigation audit trail](docs/screenshots/audit-trail.png)
+
 ---
 
 ## Architecture

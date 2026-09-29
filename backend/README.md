@@ -176,9 +176,14 @@ persisted. See `docs/architecture.md` §5.1–5.5, including the V1 delivery lim
 There is **no AI or agent functionality in this service**, by design. Reconciliation is
 fully deterministic and works with no investigation service present.
 
-Not built yet: the Python investigation agent, FastAPI, LLM calls, RAG, embeddings,
-pgvector, fee rules, investigations, recommendations, approvals, the audit API, the
-dashboard API, the React console, authentication, and AWS deployment.
+Implemented elsewhere, deliberately not here: the Python investigation agent, FastAPI,
+LLM calls, investigations, recommendations, approvals and the audit API all live in
+`agent-service/`; the React Operations Console lives in `frontend/`. This service
+serves fee rules at `/api/v1/fee-rules` as evidence for those investigations, but it
+never reads them during reconciliation.
+
+Not implemented anywhere: RAG, embeddings, pgvector (policy retrieval is deterministic
+lexical matching), the dashboard API, and authentication.
 
 If a request to this service returns an authentication error, it is not ReconAI answering:
 this service has no authentication.

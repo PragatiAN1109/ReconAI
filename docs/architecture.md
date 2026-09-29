@@ -124,15 +124,17 @@ it**.
 
 ## 3. Major Components
 
-### 3.1 Operations Console — not yet built
+### 3.1 Operations Console
 
 **Technology:** React + TypeScript + Vite
 
-**This component does not exist yet.** The backend endpoints it will call are
-implemented and tested; nothing renders them. The responsibilities below are its
-intended scope.
-
 The Operations Console provides the user interface for reconciliation analysts.
+It is implemented and deployed; see the screenshots in the repository README.
+
+In production it is served as static assets from S3 through CloudFront, which
+also proxies the two API path prefixes so the browser stays same-origin. Locally
+it is served by nginx in Docker Compose over the same prefixes, so the API
+contract is identical in both.
 
 Primary responsibilities:
 
@@ -218,7 +220,11 @@ DUPLICATE_SETTLEMENT
 CURRENCY_MISMATCH
 ```
 
-`PROCESSOR_FEE` is primarily an investigation/root-cause classification rather than a deterministic discrepancy type.
+`PROCESSOR_FEE` is **not** a deterministic discrepancy type. It is an
+investigation root-cause classification, and it appears in a different enum
+(`RootCauseClassification`) that the reconciliation engine never produces.
+Both halves of that separation are enforced by database CHECK constraints, not
+by convention.
 
 For example:
 
@@ -417,11 +423,11 @@ These four fields are the entire contract, asserted in Spring's own `KafkaDelive
 
 ---
 
-## 6. Investigation Agent Service
+## 6. Investigation Service
 
 **Technology:** Python + FastAPI
 
-The Investigation Agent Service is responsible for investigating detected reconciliation exceptions.
+The Investigation Service is responsible for investigating detected reconciliation exceptions.
 
 It receives an exception identifier and determines what information is required to investigate the discrepancy.
 
@@ -523,18 +529,25 @@ ledger support together.
 search_policy_documents(query)
 ```
 
-Searches relevant operational and financial policies using semantic retrieval.
+Searches the synthetic policy corpus using **deterministic lexical retrieval**.
+There is no embedding step and no vector store; section 8 describes the scoring
+rule and why it was chosen.
 
 The tool returns evidence containing:
 
 ```text
-document
+document_id
+title
 section
-content
-retrieval score
+excerpt
+score
 ```
 
-The investigation agent should use these references when supporting policy-related conclusions.
+`score` is a lexical relevance score, not a probability and not model confidence.
+
+The investigation agent should use these references when supporting policy-related
+conclusions. A policy citation naming a section must match a section that was
+actually returned, which is what makes the citation checkable.
 
 ---
 

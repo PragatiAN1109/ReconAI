@@ -381,7 +381,15 @@ Policy documents form the knowledge base used by the retrieval system.
 
 ## 7. Initial Reconciliation Exception Types
 
-ReconAI V1 supports five primary exception scenarios.
+ReconAI V1 detects **four** deterministic reconciliation exception types: 7.1, 7.2,
+7.3 and 7.5 below.
+
+Section 7.4 is included in this sequence for continuity with the original
+requirements, but `PROCESSOR_FEE` is **not** one of them. It is a root-cause
+classification an investigation may propose *about* an exception the deterministic
+engine has already detected — almost always an `AMOUNT_MISMATCH`. The
+reconciliation engine cannot emit it, and a database CHECK constraint prevents it
+from being stored as a detected exception type.
 
 ### 7.1 AMOUNT_MISMATCH
 
@@ -441,9 +449,13 @@ The investigation determines whether it represents an actual duplicate payment, 
 
 ---
 
-### 7.4 PROCESSOR_FEE
+### 7.4 PROCESSOR_FEE — a root cause, not a detection type
 
-A settlement discrepancy may ultimately be explained by an applicable processor or merchant fee.
+> Listed here for continuity with the original requirements. This is **not** a
+> deterministic exception type; see the note under section 7.
+
+A settlement discrepancy may ultimately be explained by an applicable processor
+or merchant fee.
 
 For example:
 
