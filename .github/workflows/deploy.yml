@@ -1,0 +1,203 @@
+name: Deploy Demo
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: reconai-demo-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+
+  ECS_CLUSTER: reconai-demo
+  FINANCIAL_CORE_SERVICE: reconai-demo-financial-core
+  INVESTIGATION_SERVICE: reconai-demo-investigation-service
+
+  FINANCIAL_CORE_REPOSITORY: reconai-demo/financial-core
+  INVESTIGATION_REPOSITORY: reconai-demo/investigation-service
+
+  FRONTEND_BUCKET: reconai-demo-frontend-904233095071
+  CLOUDFRONT_DISTRIBUTION_ID: E3GT4TYTVCOJHB
+
+jobs:
+  deploy:
+    name: Deploy ReconAI Demo
+    runs-on: ubuntu-latest
+    environment: demo
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::904233095071:role/reconai-demo-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push financial core
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -f backend/Dockerfile \
+            -t "$ECR_REGISTRY/$FINANCIAL_CORE_REPOSITORY:$IMAGE_TAG" \
+            ./backend
+
+          docker push \
+            "$ECR_REGISTRY/$FINANCIAL_CORE_REPOSITORY:$IMAGE_TAG"
+
+      - name: Build and push investigation service
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -f agent-service/Dockerfile \
+            -t "$ECR_REGISTRY/$INVESTIGATION_REPOSITORY:$IMAGE_TAG" \
+            .
+
+          docker push \
+            "$ECR_REGISTRY/$INVESTIGATION_REPOSITORY:$IMAGE_TAG"
+
+      - name: Deploy financial core
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          CURRENT_TASK_DEFINITION="$(
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$FINANCIAL_CORE_SERVICE" \
+              --query 'services[0].taskDefinition' \
+              --output text
+          )"
+
+          aws ecs describe-task-definition \
+            --task-definition "$CURRENT_TASK_DEFINITION" \
+            --query 'taskDefinition' \
+            > task-definition.json
+
+          jq \
+            --arg IMAGE "$ECR_REGISTRY/$FINANCIAL_CORE_REPOSITORY:$IMAGE_TAG" \
+            '
+            .containerDefinitions |= map(
+              if .name == "financial-core"
+              then .image = $IMAGE
+              else .
+              end
+            )
+            | del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy
+              )
+            ' \
+            task-definition.json \
+            > task-definition-updated.json
+
+          NEW_TASK_DEFINITION="$(
+            aws ecs register-task-definition \
+              --cli-input-json file://task-definition-updated.json \
+              --query 'taskDefinition.taskDefinitionArn' \
+              --output text
+          )"
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$FINANCIAL_CORE_SERVICE" \
+            --task-definition "$NEW_TASK_DEFINITION" \
+            > /dev/null
+
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$FINANCIAL_CORE_SERVICE"
+
+      - name: Deploy investigation service
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          CURRENT_TASK_DEFINITION="$(
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$INVESTIGATION_SERVICE" \
+              --query 'services[0].taskDefinition' \
+              --output text
+          )"
+
+          aws ecs describe-task-definition \
+            --task-definition "$CURRENT_TASK_DEFINITION" \
+            --query 'taskDefinition' \
+            > task-definition.json
+
+          jq \
+            --arg IMAGE "$ECR_REGISTRY/$INVESTIGATION_REPOSITORY:$IMAGE_TAG" \
+            '
+            .containerDefinitions |= map(
+              if .name == "investigation-service"
+              then .image = $IMAGE
+              else .
+              end
+            )
+            | del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy
+              )
+            ' \
+            task-definition.json \
+            > task-definition-updated.json
+
+          NEW_TASK_DEFINITION="$(
+            aws ecs register-task-definition \
+              --cli-input-json file://task-definition-updated.json \
+              --query 'taskDefinition.taskDefinitionArn' \
+              --output text
+          )"
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$INVESTIGATION_SERVICE" \
+            --task-definition "$NEW_TASK_DEFINITION" \
+            > /dev/null
+
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$INVESTIGATION_SERVICE"
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Publish frontend
+        run: |
+          aws s3 sync frontend/dist/ "s3://$FRONTEND_BUCKET/" --delete
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "/*"
