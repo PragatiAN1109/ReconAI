@@ -28,7 +28,6 @@ jobs:
   deploy:
     name: Deploy ReconAI Demo
     runs-on: ubuntu-latest
-    environment: demo
 
     steps:
       - name: Checkout repository
