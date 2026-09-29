@@ -27,7 +27,8 @@ if config.config_file_name is not None:
 # service cannot drift onto different databases. A URL set explicitly — by a
 # test pointing at a throwaway container, for instance — wins.
 if not config.get_main_option("sqlalchemy.url", None):
-    config.set_main_option("sqlalchemy.url", Settings().database_url)
+    database_url = Settings().database_url
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 
 target_metadata = Base.metadata
 

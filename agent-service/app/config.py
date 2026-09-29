@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     # It is never logged and never leaves the provider client.
     llm_provider: LlmProvider = "none"
     llm_model: str = "claude-sonnet-5"
+    llm_output_limit: int = Field(default=4096, ge=512, le=8192)
     llm_api_key: SecretStr | None = None
     #: Upper bound on tool rounds in one investigation. An unbounded agent loop
     #: is an unbounded bill.

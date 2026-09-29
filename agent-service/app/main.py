@@ -70,7 +70,9 @@ def _build_model(settings: Settings) -> InvestigationModel | None:
         settings.llm_model,
     )
     return AnthropicInvestigationModel(
-        api_key=settings.llm_api_key.get_secret_value(), model=settings.llm_model
+        api_key=settings.llm_api_key.get_secret_value(),
+        model=settings.llm_model,
+        max_tokens=settings.llm_output_limit,
     )
 
 

@@ -60,3 +60,20 @@ data/
 # Generated evaluation results. Committing metrics invites presenting a
 # favourable run as a standing claim.
 eval-results/
+
+# Terraform
+#
+# State can contain resource attributes and must never be committed. Real
+# tfvars can carry values that are not placeholders. The example file and the
+# provider lock file are deliberately NOT ignored: the lock file pins provider
+# versions and belongs in version control.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+infra/terraform.tfvars
+infra/*.auto.tfvars
+!infra/terraform.tfvars.example
+!**/.terraform.lock.hcl
