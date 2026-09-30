@@ -7,10 +7,13 @@ from sqlalchemy import Sequence, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import audit_service
 from app.database import Database
 from app.events import ReconciliationExceptionEvent
 from app.models import (
     SCHEMA,
+    ActorType,
+    AuditEventType,
     Investigation,
     InvestigationStatus,
     Recommendation,
@@ -111,6 +114,22 @@ class InvestigationService:
                 )
                 return InvestigationRecord(investigation=winner, created=False)
 
+            # Written only on a genuine insert, in the same transaction as the
+            # row itself. A redelivery returns above without reaching here, so
+            # one exception produces exactly one CREATED event however many
+            # times its event is delivered.
+            await audit_service.record(
+                session,
+                investigation_id=investigation_id,
+                event_type=AuditEventType.INVESTIGATION_CREATED,
+                actor_type=ActorType.SYSTEM,
+                metadata={
+                    "exception_id": event.exception_id,
+                    "exception_type": event.type.value,
+                    "source": "kafka",
+                },
+            )
+
             logger.info(
                 "Created investigation [investigation_id=%s exception_id=%s transaction_id=%s "
                 "exception_type=%s status=%s]",
@@ -121,6 +140,39 @@ class InvestigationService:
                 inserted.status,
             )
             return InvestigationRecord(investigation=inserted, created=True)
+
+    async def record_operational_event(
+        self,
+        investigation_id: str,
+        event_type: AuditEventType,
+        metadata: dict | None = None,
+    ) -> None:
+        """Append one operational event about a *run*, in its own transaction.
+
+        For states that describe what happened to an attempt rather than what an
+        investigation concluded — a bounded retry being scheduled, automatic
+        execution pausing. The automatic runner owns those facts but has no
+        database access of its own, and audit writes belong in this layer.
+
+        Never raises. It is called on paths that are already handling a failure,
+        and an unwritten audit line must not replace the problem it describes
+        with a second one.
+        """
+        try:
+            async with self._database.session() as session:
+                await audit_service.record(
+                    session,
+                    investigation_id=investigation_id,
+                    event_type=event_type,
+                    actor_type=ActorType.SYSTEM,
+                    metadata=metadata,
+                )
+        except Exception:
+            logger.exception(
+                "Could not record an operational event [investigation_id=%s event_type=%s]",
+                investigation_id,
+                event_type.value,
+            )
 
     async def get_by_investigation_id(self, investigation_id: str) -> Investigation | None:
         async with self._database.session() as session:

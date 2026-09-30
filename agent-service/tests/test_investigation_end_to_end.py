@@ -236,6 +236,8 @@ async def test_detection_investigation_review_and_audit(
     #    every step.
     trail = (await api.get(f"/api/v1/investigations/{investigation_id}/audit")).json()
     assert [(item["event_type"], item["actor_type"]) for item in trail["items"]] == [
+        # The Kafka event that created the investigation opens the trail.
+        ("INVESTIGATION_CREATED", "SYSTEM"),
         ("INVESTIGATION_STARTED", "SYSTEM"),
         ("AI_RESULT_GENERATED", "AI"),
         ("INVESTIGATION_AWAITING_REVIEW", "SYSTEM"),

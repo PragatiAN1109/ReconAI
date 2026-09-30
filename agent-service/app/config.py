@@ -118,6 +118,33 @@ class Settings(BaseSettings):
     run_global_limit: int = Field(default=25, ge=1, le=100_000)
     run_window_seconds: int = Field(default=3600, ge=1, le=86_400)
 
+    # Automatic, event-driven investigation.
+    #
+    # Off by default. Turning it on means a detected discrepancy spends money
+    # without anyone asking, so enabling it is a deliberate deployment decision
+    # rather than a property of the code. With it off the service behaves exactly
+    # as before: Kafka consumption records a PENDING investigation and stops.
+    #
+    # Automatic runs draw on the same global budget as manual ones — there is one
+    # ceiling, not two — and a run that cannot start leaves the investigation
+    # PENDING rather than failing it.
+    auto_investigate: bool = False
+    #: How many automatic investigations may be in flight at once. Small: each
+    #: one holds a provider connection and the point is to stay responsive, not
+    #: to parallelise.
+    auto_investigate_concurrency: int = Field(default=2, ge=1, le=10)
+    #: Attempts per event when the provider fails, including the first. Each
+    #: attempt is a separate provider call and consumes another unit of the
+    #: global budget, so this is deliberately tiny.
+    auto_investigate_max_attempts: int = Field(default=2, ge=1, le=5)
+    #: Backoff before each retry, in seconds. Consumed in order; a run with more
+    #: attempts than delays reuses the last one.
+    auto_investigate_backoff_seconds: tuple[float, ...] = (2.0, 5.0)
+    #: Longest the consumer waits for in-flight investigations during shutdown
+    #: before giving up on them. They are abandoned, not cancelled mid-write:
+    #: each one's own transaction either committed or rolled back.
+    auto_investigate_drain_seconds: float = Field(default=10.0, gt=0, le=120)
+
     @property
     def investigation_model_configured(self) -> bool:
         return self.llm_provider != "none" and self.llm_api_key is not None

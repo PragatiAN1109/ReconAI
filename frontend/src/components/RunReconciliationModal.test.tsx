@@ -59,6 +59,19 @@ function exceptionResponse(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function investigationRow(status: string) {
+  return {
+    investigation_id: "INV-2001",
+    exception_id: "EX-2001",
+    transaction_id: "TX-10043",
+    exception_type: "AMOUNT_MISMATCH",
+    status,
+    detected_at: "2026-09-30T10:00:00Z",
+    created_at: "2026-09-30T10:00:01Z",
+    updated_at: "2026-09-30T10:00:01Z",
+  };
+}
+
 function renderModal(
   onClose = vi.fn(),
   poll: { pollIntervalMs?: number; pollTimeoutMs?: number } = {},
@@ -314,40 +327,109 @@ describe("an exception run", () => {
 });
 
 describe("discovering the investigation", () => {
-  it("shows a creating state, then reveals the link once it appears", async () => {
+  it("narrates the lifecycle: started, queued, running, then complete", async () => {
+    // The investigation now starts on its own, so it appears as PENDING and
+    // moves through RUNNING before it has anything to show. Stopping at "a row
+    // exists" would link to a page with nothing on it.
     const user = userEvent.setup();
+    const statuses = ["PENDING", "RUNNING", "AWAITING_REVIEW"];
     let attempt = 0;
     stubFetch({
       demo: () => jsonResponse(201, exceptionResponse()),
       investigations: () => {
-        attempt += 1;
         // Not there on the first look: the event is still in flight.
-        return attempt === 1
-          ? jsonResponse(200, { items: [], total: 0 })
-          : jsonResponse(200, {
-              items: [
-                {
-                  investigation_id: "INV-2001",
-                  exception_id: "EX-2001",
-                  transaction_id: "TX-10043",
-                  exception_type: "AMOUNT_MISMATCH",
-                  status: "PENDING",
-                  detected_at: "2026-09-30T10:00:00Z",
-                  created_at: "2026-09-30T10:00:01Z",
-                  updated_at: "2026-09-30T10:00:01Z",
-                },
-              ],
-              total: 1,
-            });
+        if (attempt === 0) {
+          attempt += 1;
+          return jsonResponse(200, { items: [], total: 0 });
+        }
+        const status = statuses[Math.min(attempt - 1, statuses.length - 1)];
+        attempt += 1;
+        return jsonResponse(200, { items: [investigationRow(status)], total: 1 });
       },
     });
     renderModal(vi.fn(), { pollIntervalMs: 5, pollTimeoutMs: 2000 });
 
     await user.click(screen.getByRole("button", { name: "Run reconciliation" }));
-    expect(await screen.findByText(/Creating investigation/i)).toBeInTheDocument();
 
-    const link = await screen.findByRole("link", { name: /view investigation/i });
-    expect(link).toHaveAttribute("href", "/investigations/INV-2001");
+    // Only the settled state is asserted here. The pre-row copy is transient —
+    // at a 5ms interval the first poll can resolve before an assertion runs —
+    // so it is covered by its own test with a stub that never returns a row.
+    expect(await screen.findByText("Investigation complete — human review required."))
+      .toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /view investigation/i })).toHaveAttribute(
+      "href",
+      "/investigations/INV-2001",
+    );
+  });
+
+  it("says the investigation started automatically before any row exists", async () => {
+    // Deterministic: the row never appears, so the pre-row state is the only
+    // one the modal can be in.
+    const user = userEvent.setup();
+    stubFetch({
+      demo: () => jsonResponse(201, exceptionResponse()),
+      investigations: () => jsonResponse(200, { items: [], total: 0 }),
+    });
+    renderModal(vi.fn(), { pollIntervalMs: 5, pollTimeoutMs: 2000 });
+
+    await user.click(screen.getByRole("button", { name: "Run reconciliation" }));
+
+    expect(
+      await screen.findByText(/Investigation started automatically/i),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps polling while the investigation is still queued", async () => {
+    // PENDING is not a resting place any more: something will move it.
+    const user = userEvent.setup();
+    const fetchMock = stubFetch({
+      demo: () => jsonResponse(201, exceptionResponse()),
+      investigations: () => jsonResponse(200, { items: [investigationRow("PENDING")], total: 1 }),
+    });
+    renderModal(vi.fn(), { pollIntervalMs: 5, pollTimeoutMs: 120 });
+
+    await user.click(screen.getByRole("button", { name: "Run reconciliation" }));
+    expect(await screen.findByText("Investigation queued.")).toBeInTheDocument();
+
+    const early = fetchMock.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(early);
+  });
+
+  it("reports a running investigation as using controlled read-only tools", async () => {
+    const user = userEvent.setup();
+    stubFetch({
+      demo: () => jsonResponse(201, exceptionResponse()),
+      investigations: () => jsonResponse(200, { items: [investigationRow("RUNNING")], total: 1 }),
+    });
+    renderModal(vi.fn(), { pollIntervalMs: 5, pollTimeoutMs: 120 });
+
+    await user.click(screen.getByRole("button", { name: "Run reconciliation" }));
+
+    expect(
+      await screen.findByText(/controlled read-only tools/i),
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    ["ESCALATED", "Investigation escalated for human review."],
+    ["FAILED", "Investigation failed."],
+  ])("stops on the terminal status %s and still offers the link", async (status, copy) => {
+    const user = userEvent.setup();
+    const fetchMock = stubFetch({
+      demo: () => jsonResponse(201, exceptionResponse()),
+      investigations: () => jsonResponse(200, { items: [investigationRow(status)], total: 1 }),
+    });
+    renderModal(vi.fn(), { pollIntervalMs: 5, pollTimeoutMs: 2000 });
+
+    await user.click(screen.getByRole("button", { name: "Run reconciliation" }));
+    expect(await screen.findByText(copy)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /view investigation/i })).toBeInTheDocument();
+
+    // Settled, so polling stopped rather than running to the deadline.
+    const settled = fetchMock.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(fetchMock.mock.calls.length).toBe(settled);
   });
 
   it("queries by exception id rather than fetching the whole collection", async () => {

@@ -10,8 +10,13 @@ import {
   scenarioJson,
   type DemoScenario,
 } from "../demo/scenarios";
-import type { DemoReconcileResponse, ReconciledException } from "../types";
+import type {
+  DemoReconcileResponse,
+  InvestigationStatus,
+  ReconciledException,
+} from "../types";
 import { formatMoney } from "../utils/money";
+import { isSettled } from "../utils/workflow";
 import { Badge } from "./Badge";
 
 /**
@@ -45,11 +50,18 @@ type Phase =
   | { kind: "result"; response: DemoReconcileResponse }
   | { kind: "failed"; error: unknown };
 
-/** Where the investigation lookup has got to, for an exception result. */
+/**
+ * Where the investigation has got to, for an exception result.
+ *
+ * `found` carries the status, not just the identifier: an investigation now
+ * starts on its own, so it appears as PENDING and moves through RUNNING before
+ * it has anything to show. Stopping at "a row exists" would offer a link to a
+ * page with nothing on it.
+ */
 type Discovery =
   | { kind: "idle" }
   | { kind: "searching" }
-  | { kind: "found"; investigationId: string }
+  | { kind: "found"; investigationId: string; status: InvestigationStatus }
   | { kind: "timedOut" };
 
 export function RunReconciliationModal({
@@ -105,10 +117,17 @@ export function RunReconciliationModal({
         try {
           const investigation = await findInvestigationByExceptionId(exceptionId);
           if (investigation !== null) {
-            if (active.current) {
-              setDiscovery({ kind: "found", investigationId: investigation.investigation_id });
-            }
-            return;
+            if (!active.current) return;
+            // Reported on every poll, so the modal narrates the lifecycle
+            // instead of jumping from "creating" to a finished link.
+            setDiscovery({
+              kind: "found",
+              investigationId: investigation.investigation_id,
+              status: investigation.status,
+            });
+            // Keep watching until it settles. PENDING and RUNNING are both
+            // states it will leave on its own.
+            if (isSettled(investigation.status)) return;
           }
         } catch {
           // A failed lookup is not a failed run. The exception is recorded
@@ -373,11 +392,14 @@ function DiscoveryStatus({
 }) {
   if (discovery.kind === "found") {
     return (
-      <p className="discovery" style={{ marginBottom: 0 }}>
+      <div className="discovery">
+        <p className="caveat" style={{ marginBottom: 8 }} role="status">
+          {PROGRESS[discovery.status]}
+        </p>
         <Link className="btn" to={`/investigations/${discovery.investigationId}`}>
           View investigation →
         </Link>
-      </p>
+      </div>
     );
   }
 
@@ -392,10 +414,25 @@ function DiscoveryStatus({
 
   return (
     <p className="discovery caveat" style={{ marginBottom: 0 }} role="status">
-      Creating investigation…
+      Investigation started automatically…
     </p>
   );
 }
+
+/**
+ * One line per status. Deliberately concise: this modal reports progress, and
+ * the detail page is where the recommendation, evidence, guardrail and audit
+ * trail live. Duplicating them here would blur the separation the product is
+ * about.
+ */
+const PROGRESS: Record<InvestigationStatus, string> = {
+  PENDING: "Investigation queued.",
+  RUNNING: "Agent is investigating this exception using controlled read-only tools.",
+  AWAITING_REVIEW: "Investigation complete — human review required.",
+  ESCALATED: "Investigation escalated for human review.",
+  COMPLETED: "Investigation complete and reviewed.",
+  FAILED: "Investigation failed.",
+};
 
 function FailurePanel({ error }: { error: unknown }) {
   if (error instanceof ApiError && error.status === 429) {

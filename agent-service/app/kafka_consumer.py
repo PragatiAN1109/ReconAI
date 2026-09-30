@@ -11,7 +11,7 @@ import logging
 from aiokafka import AIOKafkaConsumer
 
 from app.config import Settings
-from app.investigation_service import InvestigationService
+from app.investigation_service import InvestigationRecord, InvestigationService
 from app.message_handler import RecordLocation, handle_message
 from app.processing import ProcessingOutcome
 
@@ -46,9 +46,19 @@ class ReconciliationExceptionConsumer:
     harmless rather than a duplicate investigation.
     """
 
-    def __init__(self, settings: Settings, investigation_service: InvestigationService) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        investigation_service: InvestigationService,
+        runner: object | None = None,
+    ) -> None:
         self._settings = settings
         self._investigations = investigation_service
+        # Optional. Absent when no model is configured or automatic
+        # investigation is switched off, in which case consuming an event
+        # records a PENDING investigation and stops — the behaviour this
+        # service had before automation existed.
+        self._runner = runner
         self._consumer: AIOKafkaConsumer | None = None
         self._task: asyncio.Task[None] | None = None
 
@@ -93,6 +103,12 @@ class ReconciliationExceptionConsumer:
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
 
+        # Drained after the loop stops, so nothing new is scheduled while we
+        # wait, and before the connection closes so a finishing investigation
+        # still has the resources it was started with.
+        if self._runner is not None:
+            await self._runner.drain(self._settings.auto_investigate_drain_seconds)
+
         if self._consumer is not None:
             await self._consumer.stop()
             self._consumer = None
@@ -103,13 +119,20 @@ class ReconciliationExceptionConsumer:
 
         Exposed separately from the loop so the decision — commit, skip or stop
         — can be tested without Kafka.
+
+        When automatic investigation is enabled this also *schedules* the
+        investigation, but it never waits for it. The returned outcome — and so
+        the offset commit — depends only on whether the investigation was
+        durably recorded. Provider latency, provider outages and investigation
+        failures cannot influence Kafka acknowledgement, and cannot stop the
+        loop.
         """
         event = handle_message(raw, location)
         if event is None:
             return ProcessingOutcome.INVALID
 
         try:
-            await self._investigations.create_or_get(event)
+            record = await self._investigations.create_or_get(event)
         except Exception:
             logger.exception(
                 "Could not record investigation for a valid event; its offset will not be "
@@ -122,7 +145,46 @@ class ReconciliationExceptionConsumer:
             )
             return ProcessingOutcome.RETRY_LATER
 
+        self._schedule_investigation(record)
         return ProcessingOutcome.PROCESSED
+
+    def _schedule_investigation(self, record: InvestigationRecord) -> None:
+        """Hand a newly recorded investigation to the background runner.
+
+        Only for investigations this call actually created. A redelivered event
+        returns an existing row, and that row has either been investigated, is
+        being investigated, or has already reached a terminal state — so
+        scheduling it again would at best be refused by the workflow's
+        conditional claim and at worst duplicate a paid call if that claim ever
+        weakened. Not scheduling is the cheaper guarantee.
+
+        Never raises. A scheduling problem must not turn into an uncommitted
+        offset for an investigation that was recorded successfully.
+        """
+        if self._runner is None:
+            return
+        if not record.created:
+            logger.info(
+                "Not scheduling an automatic investigation for a redelivered event "
+                "[investigation_id=%s exception_id=%s]",
+                record.investigation.investigation_id,
+                record.investigation.exception_id,
+            )
+            return
+
+        try:
+            self._runner.schedule(record.investigation.investigation_id)
+            logger.info(
+                "Automatic investigation scheduled [investigation_id=%s exception_id=%s]",
+                record.investigation.investigation_id,
+                record.investigation.exception_id,
+            )
+        except Exception:
+            logger.exception(
+                "Could not schedule an automatic investigation; the investigation remains "
+                "PENDING [investigation_id=%s]",
+                record.investigation.investigation_id,
+            )
 
     async def _consume(self) -> None:
         """Handle records until cancelled, or until a record cannot be recorded."""

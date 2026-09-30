@@ -110,6 +110,26 @@ def _failure_detail(error: Exception) -> str:
 
 
 @dataclass(frozen=True)
+class RetryContext:
+    """Where this attempt sits in a bounded sequence of them.
+
+    Supplied by whoever is doing the retrying — the automatic runner. The
+    workflow uses it for one thing: deciding whether "a retry is scheduled" is a
+    true statement to put in the audit trail. A manual run supplies nothing and
+    is treated as a single attempt with no successor.
+    """
+
+    attempt: int
+    max_attempts: int
+    #: Seconds until the next attempt, or ``None`` when this was the last one.
+    next_delay_seconds: float | None
+
+    @property
+    def another_attempt_follows(self) -> bool:
+        return self.next_delay_seconds is not None and self.attempt < self.max_attempts
+
+
+@dataclass(frozen=True)
 class WorkflowOutcome:
     """What a completed run produced."""
 
@@ -142,7 +162,9 @@ class InvestigationWorkflow:
         self._model_name = model_name
         self._prompt_version = prompt_version
 
-    async def run(self, investigation_id: str) -> WorkflowOutcome:
+    async def run(
+        self, investigation_id: str, *, retry: RetryContext | None = None
+    ) -> WorkflowOutcome:
         """Investigate one exception, persist the outcome, and route it.
 
         :raises InvestigationNotFound: no such investigation
@@ -163,7 +185,21 @@ class InvestigationWorkflow:
         # connection held hostage by a third party's latency.
         try:
             result, ledger = await self._agent.investigate(context)
-        except (InvestigationFailed, InvestigationModelError) as error:
+        except InvestigationModelError as error:
+            # RETRYABLE. The provider could not be reached, timed out, or
+            # answered with something the adapter could not use. Nothing is
+            # wrong with the exception under examination, so FAILED would be
+            # both untrue and unrecoverable: FAILED is terminal and _RUNNABLE
+            # admits only PENDING, so a two-second outage would strand the
+            # investigation forever. Released back to PENDING instead, which
+            # truthfully means "not yet run" and can be run again.
+            await self._release_for_retry(investigation_id, error, retry)
+            raise
+        except InvestigationFailed as error:
+            # NON-RETRYABLE. A malformed result, an ungrounded citation, a
+            # text-only turn or an exhausted tool budget are all deterministic
+            # outcomes of this exception and this prompt. Running it again would
+            # spend money to reach the same place, so it ends here.
             await self._record_failure(investigation_id, error)
             raise
 
@@ -366,6 +402,72 @@ class InvestigationWorkflow:
             result=result,
             ledger=ledger,
             decision=decision,
+        )
+
+    async def _release_for_retry(
+        self,
+        investigation_id: str,
+        error: Exception,
+        retry: RetryContext | None = None,
+    ) -> None:
+        """Return a claimed investigation to PENDING after a retryable failure.
+
+        Its own transaction, and it never raises, for the same reasons as
+        :meth:`_record_failure`.
+
+        **Why PENDING and not FAILED.** ``_RUNNABLE`` admits only PENDING, and
+        FAILED is terminal, so recording a provider outage as FAILED would make
+        a transient network error permanently unrecoverable. PENDING means "not
+        yet run", which is exactly what is true here.
+
+        **The audit event.** ``INVESTIGATION_RETRY_SCHEDULED`` is written only
+        when another attempt genuinely follows. Writing it when attempts are
+        exhausted would promise a retry that is not coming; that case is
+        recorded by the runner as ``INVESTIGATION_AUTO_RUN_PAUSED`` instead,
+        because "automatic execution stopped" is a fact about the runner rather
+        than about this transaction.
+
+        Metadata carries the attempt counters, the backoff and the exception
+        *class* — never the provider's error string, which can embed request
+        detail the audit trail promises not to hold.
+        """
+        try:
+            async with self._database.session() as session:
+                await session.execute(
+                    update(Investigation)
+                    .where(
+                        Investigation.investigation_id == investigation_id,
+                        Investigation.status == InvestigationStatus.RUNNING.value,
+                    )
+                    .values(status=InvestigationStatus.PENDING.value, updated_at=func.now())
+                )
+                if retry is not None and retry.another_attempt_follows:
+                    await audit_service.record(
+                        session,
+                        investigation_id=investigation_id,
+                        event_type=AuditEventType.INVESTIGATION_RETRY_SCHEDULED,
+                        actor_type=ActorType.SYSTEM,
+                        metadata={
+                            "attempt": retry.attempt,
+                            "max_attempts": retry.max_attempts,
+                            "backoff_seconds": retry.next_delay_seconds,
+                            "failure_category": type(error).__name__,
+                        },
+                    )
+        except Exception:
+            logger.exception(
+                "Could not release the investigation; it remains RUNNING "
+                "[investigation_id=%s]",
+                investigation_id,
+            )
+            return
+
+        logger.warning(
+            "Investigation released for retry after a provider failure; it is PENDING again "
+            "[investigation_id=%s failure_type=%s detail=%s]",
+            investigation_id,
+            type(error).__name__,
+            _failure_detail(error),
         )
 
     async def _record_failure(self, investigation_id: str, error: Exception) -> None:

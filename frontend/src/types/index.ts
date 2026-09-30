@@ -240,7 +240,11 @@ export type AuditEventType =
   | "INVESTIGATION_ESCALATED"
   | "INVESTIGATION_FAILED"
   | "REVIEW_APPROVED"
-  | "REVIEW_REJECTED";
+  | "REVIEW_REJECTED"
+  // Operational states of automatic execution. Neither is terminal: the
+  // investigation stays PENDING and is recoverable by an operator.
+  | "INVESTIGATION_RETRY_SCHEDULED"
+  | "INVESTIGATION_AUTO_RUN_PAUSED";
 
 export interface AuditEvent {
   event_id: string;

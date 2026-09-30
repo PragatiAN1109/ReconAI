@@ -64,8 +64,19 @@ class FixedWindowRateLimiter:
     def __post_init__(self) -> None:
         self._window_start = self.monotonic()
 
-    def check(self, client_key: str) -> Decision:
-        """Record one request against ``client_key`` and say whether it may run.
+    def check(self, client_key: str | None) -> Decision:
+        """Record one request and say whether it may run.
+
+        ``client_key`` of ``None`` means **global only**: count this attempt
+        against the shared ceiling and skip the per-client dimension entirely.
+        That is the correct reading for an automatically triggered run, which
+        has no requesting client — a Kafka event is not a visitor. Charging it
+        to a synthetic key would either exhaust a per-client allowance that
+        describes nobody, or hand automation its own separate budget, and a
+        second budget is not a ceiling.
+
+        Both callers share one limiter instance, so the global count is the real
+        spend ceiling across manual and automatic runs together.
 
         Rolling the window and testing the counters happen together. Splitting
         them would let a roll race a test and either admit more than the limit
@@ -76,20 +87,22 @@ class FixedWindowRateLimiter:
         if self._global_count >= self.global_limit:
             logger.warning(
                 "Refusing investigation run: global window limit reached "
-                "[limit=%d window_seconds=%s]",
+                "[limit=%d window_seconds=%s automatic=%s]",
                 self.global_limit,
                 self.window_seconds,
+                client_key is None,
             )
             return Decision.GLOBAL_LIMIT_REACHED
 
-        if self._per_client.get(client_key, 0) >= self.per_client_limit:
-            logger.warning(
-                "Refusing investigation run: per-client window limit reached [limit=%d]",
-                self.per_client_limit,
-            )
-            return Decision.PER_CLIENT_LIMIT_REACHED
+        if client_key is not None:
+            if self._per_client.get(client_key, 0) >= self.per_client_limit:
+                logger.warning(
+                    "Refusing investigation run: per-client window limit reached [limit=%d]",
+                    self.per_client_limit,
+                )
+                return Decision.PER_CLIENT_LIMIT_REACHED
+            self._per_client[client_key] = self._per_client.get(client_key, 0) + 1
 
-        self._per_client[client_key] = self._per_client.get(client_key, 0) + 1
         self._global_count += 1
         return Decision.ALLOWED
 

@@ -20,8 +20,15 @@ class FakeModel:
     context, system prompt and tool specifications.
     """
 
-    def __init__(self, turns: Sequence[AssistantTurn]) -> None:
+    def __init__(
+        self, turns: Sequence[AssistantTurn], raises_after: Exception | None = None
+    ) -> None:
         self._turns = list(turns)
+        # Raised once the script runs out, for testing a provider that fails
+        # partway through an investigation — during a correction call, say.
+        # Without it the fake loops on a tool request instead, which is a
+        # different failure mode.
+        self._raises_after = raises_after
         self.calls = 0
         self.seen_transcripts: list[list[TranscriptEntry]] = []
         self.seen_system_prompts: list[str] = []
@@ -41,6 +48,8 @@ class FakeModel:
 
         if self._turns:
             return self._turns.pop(0)
+        if self._raises_after is not None:
+            raise self._raises_after
         # Past the script: keep asking for the same tool, which is how a model
         # stuck in a loop behaves and what the round bound exists to stop.
         return tool_turn("get_transaction", {"transaction_id": context.transaction_id})
@@ -53,7 +62,13 @@ def tool_turn(tool: str, arguments: Mapping[str, Any], call_id: str = "call-1") 
 
 
 def final_turn(**payload: Any) -> AssistantTurn:
-    """A final result, with the common fields defaulted."""
+    """A final result, with the common fields defaulted.
+
+    Passing ``...`` (Ellipsis) for a field **removes** it, which is how an
+    omitted required field is expressed. That distinction matters: INV-1004
+    failed because ``confidence`` was absent, not because it was null, and the
+    two produce different Pydantic errors.
+    """
     result: dict[str, Any] = {
         "classification": "PROCESSOR_FEE",
         "rootCause": "A settlement processing fee is consistent with the difference.",
@@ -63,4 +78,6 @@ def final_turn(**payload: Any) -> AssistantTurn:
         "requiresHumanApproval": True,
     }
     result.update(payload)
-    return AssistantTurn(final_result=result)
+    return AssistantTurn(
+        final_result={key: value for key, value in result.items() if value is not ...}
+    )

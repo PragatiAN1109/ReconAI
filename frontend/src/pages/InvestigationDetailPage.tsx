@@ -13,7 +13,6 @@ import {
   getAuditTrail,
   getInvestigation,
   getRecommendation,
-  runInvestigation,
 } from "../api/investigations";
 import { getException, getSettlements, getTransaction } from "../api/financialCore";
 import { ApiError } from "../api/client";
@@ -26,8 +25,11 @@ import {
 } from "../utils/money";
 import { formatTimestamp } from "../utils/datetime";
 import {
+  autoRunPausedReasonFrom,
+  failureDetailFrom,
   guardrailReasonFrom,
   guardrailThresholdFrom,
+  isSettled,
   humanise,
   isNonConclusive,
   recordedDecisionFrom,
@@ -38,7 +40,6 @@ import { AuditTimeline } from "../components/AuditTimeline";
 import { EvidenceList } from "../components/Evidence";
 import { ReviewPanel } from "../components/ReviewPanel";
 import { ErrorPanel, LoadingPanel, Notice } from "../components/StateViews";
-import { RunAiInvestigationPanel } from "../components/RunAiInvestigationPanel";
 
 /**
  * One investigation, end to end.
@@ -51,6 +52,9 @@ import { RunAiInvestigationPanel } from "../components/RunAiInvestigationPanel";
  * to avoid.
  */
 
+/** How often an unsettled investigation is re-read. Overridable for tests. */
+const DEFAULT_REFRESH_INTERVAL_MS = 3000;
+
 interface CaseData {
   investigation: Investigation;
   recommendation: Recommendation | null;
@@ -62,7 +66,11 @@ interface CaseData {
   coreUnavailable: boolean;
 }
 
-export function InvestigationDetailPage() {
+export function InvestigationDetailPage({
+  refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS,
+}: {
+  refreshIntervalMs?: number;
+} = {}) {
   const { investigationId = "" } = useParams();
   const [data, setData] = useState<CaseData | null>(null);
   const [error, setError] = useState<unknown>(null);
@@ -120,6 +128,17 @@ export function InvestigationDetailPage() {
     void load();
   }, [load]);
 
+  // An investigation now starts on its own, so a visitor who opens this page
+  // while one is queued or running would otherwise sit looking at a stale
+  // status until they thought to refresh. Polling stops as soon as the
+  // investigation settles, so a finished case costs nothing.
+  const status = data?.investigation.status;
+  useEffect(() => {
+    if (status === undefined || isSettled(status)) return;
+    const timer = setInterval(() => void load(), refreshIntervalMs);
+    return () => clearInterval(timer);
+  }, [status, load, refreshIntervalMs]);
+
   if (loading && data === null) {
     return (
       <div className="page">
@@ -155,6 +174,8 @@ export function InvestigationDetailPage() {
   const threshold = guardrailThresholdFrom(audit);
   const guardrailReason = guardrailReasonFrom(audit);
   const decision = recordedDecisionFrom(audit);
+  const failureDetail = failureDetailFrom(audit);
+  const autoRunPausedReason = autoRunPausedReasonFrom(audit);
 
   return (
     <div className="page">
@@ -176,17 +197,36 @@ export function InvestigationDetailPage() {
         </Notice>
       )}
 
+      {investigation.status === "PENDING" && (
+        <Notice
+          tone={autoRunPausedReason === null ? "info" : "warning"}
+          title="Investigation queued"
+        >
+          {/* Branches on what the audit trail recorded, never on how long the
+              investigation has sat here. Elapsed time says nothing about the
+              cause. */}
+          {autoRunPausedReason === "AI_BUDGET_EXHAUSTED"
+            ? "Automatic investigation is temporarily unavailable because the demo AI budget is exhausted."
+            : autoRunPausedReason === "PROVIDER_UNAVAILABLE"
+              ? "Automatic investigation stopped because the model provider could not be reached."
+              : "This exception was detected deterministically and is queued for automatic investigation."}
+        </Notice>
+      )}
+
       {investigation.status === "RUNNING" && (
         <Notice tone="info" title="Investigation in progress">
-          Evidence gathering is under way. Refresh to see the outcome.
+          The agent is investigating this exception using controlled read-only tools.
+          This page refreshes on its own.
         </Notice>
       )}
 
       {investigation.status === "FAILED" && (
         <Notice tone="error" title="Investigation failed">
-          This investigation ended without a usable result — either the evidence did not
-          support a conclusion, or a cited reference could not be verified. Nothing was
-          stored, and no recommendation exists. See the audit trail below.
+          {/* The reason as recorded at the time, not a guess. The page used to
+              assert a cause it could not know, and named the wrong one for a
+              malformed structured result. */}
+          {failureDetail ?? "This investigation ended without a usable result."} Nothing
+          was stored, and no recommendation exists. See the audit trail below.
         </Notice>
       )}
 
@@ -226,22 +266,17 @@ export function InvestigationDetailPage() {
           </div>
           <div className="card-body">
             <p className="section-note" style={{ marginBottom: 0 }}>
+              {/* No manual run control. An exception reaching this service is
+                  investigated automatically; a person decides what to do with
+                  the recommendation, not whether one gets produced. */}
               {investigation.status === "PENDING"
-                ? "This investigation has not been run. No conclusion exists yet."
+                ? autoRunPausedReason === null
+                  ? "Queued for automatic investigation. No conclusion exists yet."
+                  : "No conclusion exists yet. Automatic investigation did not start; see the notice above."
                 : investigation.status === "RUNNING"
                   ? "The investigation is running. No conclusion has been stored yet."
                   : "No recommendation was stored for this investigation."}
             </p>
-            {/* Only for PENDING. Every other status either has a result, is
-                mid-flight, or has been decided — and the backend refuses a
-                second run with 409 in all of them. */}
-            {investigation.status === "PENDING" && (
-              <RunAiInvestigationPanel
-                investigationId={investigation.investigation_id}
-                onRun={() => runInvestigation(investigation.investigation_id)}
-                onCompleted={() => void load()}
-              />
-            )}
           </div>
         </section>
       )}

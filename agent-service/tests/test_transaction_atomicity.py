@@ -355,7 +355,11 @@ async def test_a_failure_persisting_evidence_leaves_nothing_behind(
     assert await status_of(verifier, investigation_id) == "FAILED"
 
     types = await audit_types(verifier, investigation_id)
-    assert types == ["INVESTIGATION_STARTED", "INVESTIGATION_FAILED"]
+    assert types == [
+        "INVESTIGATION_CREATED",
+        "INVESTIGATION_STARTED",
+        "INVESTIGATION_FAILED",
+    ]
     assert "AI_RESULT_GENERATED" not in types
     assert "INVESTIGATION_AWAITING_REVIEW" not in types
 
@@ -382,6 +386,7 @@ async def test_a_failure_persisting_the_success_audit_rolls_back_the_result(
     assert await evidence_count(verifier, investigation_id) == 0
     assert await status_of(verifier, investigation_id) == "FAILED"
     assert await audit_types(verifier, investigation_id) == [
+        "INVESTIGATION_CREATED",
         "INVESTIGATION_STARTED",
         "INVESTIGATION_FAILED",
     ]

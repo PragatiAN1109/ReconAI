@@ -59,13 +59,15 @@ export async function findInvestigationByExceptionId(
 /**
  * Run the AI investigation for one PENDING investigation.
  *
- * Deliberately a separate, explicit action. Detecting a discrepancy is
- * deterministic and free; investigating one calls a language model and costs
- * money, so nothing triggers it implicitly — not reconciliation, not Kafka
- * consumption, not opening this page.
+ * **Intentionally not called by the console.** An exception reaching the
+ * Investigation Service is now investigated automatically, so there is no
+ * public control that starts one — a visitor decides what to do with a
+ * recommendation, not whether one gets produced.
  *
- * The server refuses a second run with 409 and throttles the endpoint with 429,
- * both of which the caller is expected to surface rather than retry.
+ * Kept as the typed client for the endpoint, which remains available as an
+ * operator escape hatch: recovering an investigation left PENDING by an
+ * exhausted AI budget, or one stuck after a crash. The server refuses a second
+ * run with 409 and throttles with 429.
  */
 export function runInvestigation(id: string): Promise<RunResult> {
   return post<RunResult>(`${INVESTIGATION_BASE}/investigations/${id}/run`);

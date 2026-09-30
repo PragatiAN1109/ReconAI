@@ -632,16 +632,43 @@ async def test_an_ungrounded_result_fails_the_investigation_and_stores_nothing(
     assert await investigations.get_recommendation(investigation_id) is None
 
 
-async def test_a_provider_outage_fails_the_investigation(
+async def test_a_provider_outage_releases_the_investigation_for_retry(
     database: Database, investigations: InvestigationService
 ) -> None:
+    """A provider outage is retryable, so it must not be terminal.
+
+    FAILED is terminal and ``_RUNNABLE`` admits only PENDING, so recording an
+    unreachable provider as FAILED would make a transient network error
+    permanently unrecoverable. Released back to PENDING instead — which is also
+    simply true: the investigation has not run.
+    """
     investigation_id = await given_pending(investigations, "EX-5051")
     agent = StubAgent(raises=InvestigationModelError("provider unreachable"))
 
     with pytest.raises(InvestigationModelError):
         await build_workflow(database, agent).run(investigation_id)
 
-    assert await status_of(database, investigation_id) == "FAILED"
+    assert await status_of(database, investigation_id) == "PENDING"
+    # Nothing partial was stored on the way out.
+    assert await investigations.get_recommendation(investigation_id) is None
+
+
+async def test_an_investigation_released_after_an_outage_can_be_run_again(
+    database: Database, investigations: InvestigationService
+) -> None:
+    """The point of releasing rather than failing: a second attempt is possible."""
+    investigation_id = await given_pending(investigations, "EX-5052")
+
+    with pytest.raises(InvestigationModelError):
+        await build_workflow(
+            database, StubAgent(raises=InvestigationModelError("provider unreachable"))
+        ).run(investigation_id)
+
+    # The provider recovers and the same investigation now succeeds.
+    await build_workflow(database, StubAgent()).run(investigation_id)
+
+    assert await status_of(database, investigation_id) == "AWAITING_REVIEW"
+    assert await investigations.get_recommendation(investigation_id) is not None
 
 
 async def test_a_failure_does_not_leave_the_investigation_running(
@@ -922,6 +949,9 @@ async def test_a_full_lifecycle_is_recorded_in_order(
     )
 
     assert await event_types(audit, investigation_id) == [
+        # Written when the Kafka event created the investigation, so the trail
+        # starts where the investigation started rather than where it was run.
+        "INVESTIGATION_CREATED",
         "INVESTIGATION_STARTED",
         "AI_RESULT_GENERATED",
         "INVESTIGATION_AWAITING_REVIEW",
@@ -943,7 +973,13 @@ async def test_each_event_names_who_caused_it(
 
     events = await audit.list_for_investigation(investigation_id)
 
-    assert [entry.actor_type for entry in events] == ["SYSTEM", "AI", "SYSTEM", "HUMAN"]
+    assert [entry.actor_type for entry in events] == [
+        "SYSTEM",  # created from the Kafka event
+        "SYSTEM",  # run started
+        "AI",      # the model's conclusion
+        "SYSTEM",  # the deterministic guardrail's routing
+        "HUMAN",   # the decision
+    ]
     assert events[-1].actor_id == "ops.analyst"
     # System and AI events claim no human identity.
     assert all(entry.actor_id is None for entry in events[:-1])
@@ -1006,6 +1042,7 @@ async def test_a_failure_is_recorded_in_the_trail(
     events = await audit.list_for_investigation(investigation_id)
 
     assert [entry.event_type for entry in events] == [
+        "INVESTIGATION_CREATED",
         "INVESTIGATION_STARTED",
         "INVESTIGATION_FAILED",
     ]
@@ -1051,8 +1088,17 @@ async def test_the_trail_stays_ordered_past_a_five_digit_sequence(
     investigation_id = await given_awaiting_review(database, investigations, "EX-7007")
     events = await audit.list_for_investigation(investigation_id)
 
-    assert [entry.event_id for entry in events] == ["AUD-9999", "AUD-10000", "AUD-10001"]
+    # The point is the 9999 -> 10000 crossing: text ordering would put AUD-10000
+    # before AUD-9999, integer ordering does not. Derived from the trail's own
+    # length so adding a lifecycle event does not require editing the numbers.
+    assert [entry.event_id for entry in events] == [
+        f"AUD-{9999 + offset}" for offset in range(len(events))
+    ]
+    assert len(events) > 1, "the crossing needs at least two events to be meaningful"
+    assert events[0].event_id == "AUD-9999"
+    assert events[1].event_id == "AUD-10000"
     assert [entry.event_type for entry in events] == [
+        "INVESTIGATION_CREATED",
         "INVESTIGATION_STARTED",
         "AI_RESULT_GENERATED",
         "INVESTIGATION_AWAITING_REVIEW",
@@ -1065,7 +1111,7 @@ async def test_audit_events_belong_only_to_their_own_investigation(
     first = await given_awaiting_review(database, investigations, "EX-7008")
     second = await given_awaiting_review(database, investigations, "EX-7009")
 
-    assert len(await audit.list_for_investigation(first)) == 3
+    assert len(await audit.list_for_investigation(first)) == 4
     assert all(
         entry.investigation_id == second
         for entry in await audit.list_for_investigation(second)
@@ -1094,6 +1140,11 @@ async def test_an_audit_event_survives_only_if_its_transaction_commits(
     from app import audit_service  # noqa: PLC0415
     from app.models import ActorType, AuditEventType  # noqa: PLC0415
 
+    # Creating the investigation writes its own CREATED event, which committed.
+    # What must not survive is the event this test rolls back.
+    before = [entry.event_type for entry in await audit.list_for_investigation(investigation_id)]
+    assert before == ["INVESTIGATION_CREATED"]
+
     with pytest.raises(RuntimeError, match="forced"):
         async with database.session() as session:
             await audit_service.record(
@@ -1104,4 +1155,5 @@ async def test_an_audit_event_survives_only_if_its_transaction_commits(
             )
             raise RuntimeError("forced")
 
-    assert await audit.list_for_investigation(investigation_id) == []
+    after = [entry.event_type for entry in await audit.list_for_investigation(investigation_id)]
+    assert after == before

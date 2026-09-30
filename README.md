@@ -4,7 +4,37 @@
 
 ReconAI is an event-driven payment reconciliation and exception-investigation platform built around one principle: **AI can investigate financial discrepancies, but it should not decide financial truth or mutate authoritative records.**
 
-A Java/Spring Boot financial core deterministically compares transactions and settlements. When it detects a discrepancy, Kafka asynchronously triggers a Python/FastAPI investigation service. The investigation agent gathers evidence through a small set of controlled, read-only tools, produces a grounded recommendation, and passes the result through deterministic guardrails before a human reviews it.
+A Java/Spring Boot financial core deterministically compares transactions and settlements. When it detects a discrepancy, Kafka asynchronously triggers a Python/FastAPI investigation service. The investigation starts on its own — no one has to ask for it — and the agent gathers evidence through a small set of controlled, read-only tools, produces a grounded recommendation, and passes the result through deterministic guardrails before a human reviews it.
+
+```text
+Transaction + Settlement
+        ↓
+deterministic reconciliation          ← no model involved
+        ↓
+   no discrepancy ──────────────────▶ done, no investigation, no AI call
+        ↓ exception
+persist deterministic exception
+        ↓  AFTER_COMMIT
+Kafka  reconciliation.exceptions
+        ↓
+investigation created (PENDING)
+        ↓  automatically, within a global AI budget
+controlled read-only tools gather evidence
+        ↓
+model proposes a root cause
+        ↓
+strict structured-result validation   ← one corrected resubmission allowed,
+        ↓                                 never a value filled in by the app
+citation grounding against what tools returned
+        ↓
+deterministic confidence guardrail
+        ↓
+AWAITING_REVIEW  or  ESCALATED
+        ↓
+HUMAN: approve / reject / escalate    ← the only route to COMPLETED
+```
+
+The human authorises what happens to a recommendation. The human does not have to tell the agent to begin.
 
 **Live Demo:** https://reconai.pragatinarote.com
 

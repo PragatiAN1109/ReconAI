@@ -533,6 +533,20 @@ async def test_an_empty_policy_search_cannot_be_cited(policies: PolicySearch) ->
         ("unknown evidence source", {"evidence": [{"sourceType": "RUMOUR", "reference": "X"}]}),
         ("evidence missing a reference", {"evidence": [{"sourceType": "SETTLEMENT"}]}),
         ("unexpected field", {"shouldEscalate": True}),
+        # INV-1004 in the deployed environment: the model invoked the final
+        # tool without confidence, which the schema already listed as required.
+        # Asserted here at the agent level, not only in the model's own tests,
+        # because this is the path that turns it into a failed investigation.
+        ("confidence omitted entirely", {"confidence": ...}),
+        ("confidence explicitly null", {"confidence": None}),
+        ("empty recommended action", {"recommendedAction": ""}),
+        ("root cause over the length limit", {"rootCause": "x" * 2001}),
+        ("recommended action over the length limit", {"recommendedAction": "x" * 2001}),
+        ("empty evidence reference", {"evidence": [{"sourceType": "FEE_RULE", "reference": ""}]}),
+        (
+            "unexpected evidence field",
+            {"evidence": [{"sourceType": "FEE_RULE", "reference": "FR-1", "certainty": "high"}]},
+        ),
     ],
 )
 async def test_a_malformed_result_is_rejected(

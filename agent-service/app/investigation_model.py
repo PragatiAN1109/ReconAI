@@ -44,6 +44,14 @@ class ToolResult:
     failed: bool = False
 
 
+#: The name of the tool a model calls to deliver its conclusion.
+#:
+#: Part of this boundary's vocabulary rather than any provider's: making the
+#: final answer a named tool call is our design choice, and the agent needs the
+#: name to address a rejected submission when asking for a correction.
+SUBMIT_RESULT_TOOL = "submit_investigation_result"
+
+
 @dataclass(frozen=True)
 class AssistantTurn:
     """One model turn: either tool requests, or a final answer.
@@ -51,14 +59,28 @@ class AssistantTurn:
     ``final_result`` is a raw mapping rather than an ``InvestigationResult``.
     Validation belongs to the workflow, so that a malformed result is something
     we detect rather than something a provider is trusted to prevent.
+
+    ``final_call_id`` identifies the submission, so a rejected one can be
+    answered. Providers that model the final answer as a tool call give it an
+    identifier; the correction has to reference that identifier or the provider
+    cannot match the reply to the request. It is plain ``str | None`` — an
+    opaque token this side never interprets — so nothing about the shape is
+    specific to one provider, and a provider that has no such concept simply
+    leaves it unset and forgoes correction.
     """
 
     tool_calls: tuple[ToolCall, ...] = ()
     final_result: Mapping[str, Any] | None = None
+    final_call_id: str | None = None
 
     @property
     def is_final(self) -> bool:
         return self.final_result is not None
+
+    @property
+    def is_correctable(self) -> bool:
+        """True when a rejected submission can be answered with feedback."""
+        return self.is_final and self.final_call_id is not None
 
 
 @dataclass(frozen=True)
@@ -118,8 +140,20 @@ Rules:
   approve anything. Never state or imply that you have.
 - Every recommendation is advisory and requires human review.
 
-When you have gathered what you need, return a final result with:
-classification, rootCause, confidence (0.0-1.0), evidence (a list of
-sourceType/reference, optionally section), recommendedAction, and
-requiresHumanApproval (always true).
+Submitting the final result:
+
+When you have gathered what you need, call the submit tool once. **Every field
+below is required. A result missing any of them is discarded and the
+investigation fails, so none can be left out.**
+
+- classification — one of the listed values.
+- rootCause — under 2000 characters.
+- confidence — a number from 0.0 to 1.0. This is your own assessment of how well
+  the evidence supports your conclusion; report it honestly, including when it is
+  low. A low number is a useful answer and routes the case to a human. Never omit
+  this field.
+- evidence — a list of sourceType/reference pairs, optionally with section. Cite
+  only identifiers a tool actually returned to you in this conversation.
+- recommendedAction — under 2000 characters.
+- requiresHumanApproval — always true. You cannot approve anything.
 """

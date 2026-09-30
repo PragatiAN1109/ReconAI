@@ -132,6 +132,29 @@ class AuditEventType(StrEnum):
     REVIEW_APPROVED = "REVIEW_APPROVED"
     REVIEW_REJECTED = "REVIEW_REJECTED"
 
+    # --- operational states of automatic execution -------------------------
+    #
+    # These describe what happened to a *run*, not what an investigation
+    # concluded, and neither is terminal. They exist because the alternative was
+    # recording a provider outage or an exhausted budget as
+    # INVESTIGATION_FAILED, which would put a terminal failure in the trail of
+    # an investigation that has not failed — and which the detail page would
+    # then render as failed.
+    #
+    # No migration is needed: `event_type` is a plain VARCHAR(50) with no CHECK
+    # constraint (only `actor_type` is constrained), so the set of event types is
+    # an application contract rather than a schema one.
+
+    #: A provider failure released a claimed investigation RUNNING -> PENDING
+    #: and another attempt is coming. Written only when one actually follows.
+    INVESTIGATION_RETRY_SCHEDULED = "INVESTIGATION_RETRY_SCHEDULED"
+
+    #: Automatic execution stopped without a conclusion and none is scheduled.
+    #: Carries a `reason`: AI_BUDGET_EXHAUSTED or PROVIDER_UNAVAILABLE. The
+    #: investigation stays PENDING and is recoverable through the operator run
+    #: endpoint; it does not resume on its own.
+    INVESTIGATION_AUTO_RUN_PAUSED = "INVESTIGATION_AUTO_RUN_PAUSED"
+
 
 class Recommendation(Base):
     """The durable AI explanation for one investigation.

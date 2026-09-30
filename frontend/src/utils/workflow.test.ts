@@ -2,12 +2,17 @@ import { describe, expect, it } from "vitest";
 
 import type { AuditEvent, InvestigationStatus } from "../types";
 import {
+  autoRunPausedReasonFrom,
   countByStatus,
+  describeAuditEvent,
+  failureDetailFrom,
+  failureTypeFrom,
   guardrailReasonFrom,
   guardrailThresholdFrom,
   humanise,
   isNonConclusive,
   isReviewable,
+  isSettled,
   recordedDecisionFrom,
   statusTone,
 } from "./workflow";
@@ -182,5 +187,174 @@ describe("humanise acronyms", () => {
 
   it("still title-cases ordinary words", () => {
     expect(humanise("INVESTIGATION_ESCALATED")).toBe("Investigation Escalated");
+  });
+});
+
+describe("failureDetailFrom", () => {
+  /**
+   * The FAILED notice used to assert a cause it could not know — "the evidence
+   * did not support a conclusion, or a cited reference could not be verified" —
+   * which was wrong for INV-1004, a malformed structured result. The real
+   * reason is already in the audit trail.
+   */
+  function failure(metadata: Record<string, unknown> | null): AuditEvent {
+    return {
+      event_id: "AUD-1",
+      investigation_id: "INV-1004",
+      event_type: "INVESTIGATION_FAILED",
+      actor_type: "SYSTEM",
+      actor_id: null,
+      metadata,
+      occurred_at: "2026-09-30T10:00:00Z",
+    };
+  }
+
+  it("returns the recorded detail", () => {
+    expect(
+      failureDetailFrom([failure({ detail: "returned a malformed result" })]),
+    ).toBe("returned a malformed result");
+  });
+
+  it("returns the failure type separately, for the category", () => {
+    expect(
+      failureTypeFrom([failure({ failure_type: "UngroundedResultError" })]),
+    ).toBe("UngroundedResultError");
+  });
+
+  it("returns null when no failure was recorded, so the UI can fall back", () => {
+    expect(failureDetailFrom([])).toBeNull();
+  });
+
+  it("returns null rather than an empty string", () => {
+    // An empty detail must not render as a blank sentence.
+    expect(failureDetailFrom([failure({ detail: "   " })])).toBeNull();
+  });
+
+  it("ignores metadata that is absent or the wrong shape", () => {
+    expect(failureDetailFrom([failure(null)])).toBeNull();
+    expect(failureDetailFrom([failure({ detail: 42 })])).toBeNull();
+  });
+
+  it("ignores events that are not failures", () => {
+    const escalated: AuditEvent = {
+      ...failure({ detail: "not a failure" }),
+      event_type: "INVESTIGATION_ESCALATED",
+    };
+    expect(failureDetailFrom([escalated])).toBeNull();
+  });
+});
+
+describe("isSettled", () => {
+  /**
+   * With automatic execution, PENDING is no longer a resting place: something
+   * will move it, so a client watching an investigation must keep watching.
+   */
+  it("treats PENDING and RUNNING as still moving", () => {
+    expect(isSettled("PENDING")).toBe(false);
+    expect(isSettled("RUNNING")).toBe(false);
+  });
+
+  it("treats a routed or decided investigation as settled", () => {
+    expect(isSettled("AWAITING_REVIEW")).toBe(true);
+    expect(isSettled("ESCALATED")).toBe(true);
+    expect(isSettled("COMPLETED")).toBe(true);
+    expect(isSettled("FAILED")).toBe(true);
+  });
+
+  it("covers every status, so a new one cannot be silently unhandled", () => {
+    const statuses: InvestigationStatus[] = [
+      "PENDING",
+      "RUNNING",
+      "AWAITING_REVIEW",
+      "COMPLETED",
+      "FAILED",
+      "ESCALATED",
+    ];
+    expect(statuses.filter((status) => !isSettled(status))).toEqual(["PENDING", "RUNNING"]);
+  });
+});
+
+describe("autoRunPausedReasonFrom", () => {
+  /**
+   * The PENDING copy must be derived from what was recorded, never inferred
+   * from how long an investigation has sat there — elapsed time says nothing
+   * about the cause.
+   */
+  function paused(metadata: Record<string, unknown> | null): AuditEvent {
+    return {
+      event_id: "AUD-2",
+      investigation_id: "INV-2001",
+      event_type: "INVESTIGATION_AUTO_RUN_PAUSED",
+      actor_type: "SYSTEM",
+      actor_id: null,
+      metadata,
+      occurred_at: "2026-09-30T10:00:00Z",
+    };
+  }
+
+  it("returns the recorded budget reason", () => {
+    expect(autoRunPausedReasonFrom([paused({ reason: "AI_BUDGET_EXHAUSTED" })])).toBe(
+      "AI_BUDGET_EXHAUSTED",
+    );
+  });
+
+  it("returns the recorded provider reason", () => {
+    expect(autoRunPausedReasonFrom([paused({ reason: "PROVIDER_UNAVAILABLE" })])).toBe(
+      "PROVIDER_UNAVAILABLE",
+    );
+  });
+
+  it("returns null when nothing paused, which is the normal case", () => {
+    expect(autoRunPausedReasonFrom([])).toBeNull();
+  });
+
+  it("ignores a scheduled retry, which is not a pause", () => {
+    const retry: AuditEvent = {
+      ...paused({ attempt: 1 }),
+      event_type: "INVESTIGATION_RETRY_SCHEDULED",
+    };
+    expect(autoRunPausedReasonFrom([retry])).toBeNull();
+  });
+
+  it("prefers the most recent pause when an investigation paused twice", () => {
+    // Recovered by an operator, then paused again: the latest explains now.
+    expect(
+      autoRunPausedReasonFrom([
+        paused({ reason: "PROVIDER_UNAVAILABLE" }),
+        paused({ reason: "AI_BUDGET_EXHAUSTED" }),
+      ]),
+    ).toBe("AI_BUDGET_EXHAUSTED");
+  });
+
+  it("ignores metadata that is absent or the wrong shape", () => {
+    expect(autoRunPausedReasonFrom([paused(null)])).toBeNull();
+    expect(autoRunPausedReasonFrom([paused({ reason: 7 })])).toBeNull();
+    expect(autoRunPausedReasonFrom([paused({ reason: "  " })])).toBeNull();
+  });
+});
+
+describe("describeAuditEvent for operational states", () => {
+  function event(type: AuditEvent["event_type"]): AuditEvent {
+    return {
+      event_id: "AUD-3",
+      investigation_id: "INV-2001",
+      event_type: type,
+      actor_type: "SYSTEM",
+      actor_id: null,
+      metadata: null,
+      occurred_at: "2026-09-30T10:00:00Z",
+    };
+  }
+
+  it("describes a scheduled retry without calling it a failure", () => {
+    const text = describeAuditEvent(event("INVESTIGATION_RETRY_SCHEDULED"));
+    expect(text).toMatch(/another attempt was scheduled/i);
+    expect(text).not.toMatch(/failed/i);
+  });
+
+  it("describes a pause as still queued rather than as a failure", () => {
+    const text = describeAuditEvent(event("INVESTIGATION_AUTO_RUN_PAUSED"));
+    expect(text).toMatch(/still queued/i);
+    expect(text).not.toMatch(/failed/i);
   });
 });

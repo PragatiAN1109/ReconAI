@@ -23,10 +23,61 @@ Kafka event ──▶ PENDING ──▶ RUNNING ──▶ AWAITING_REVIEW ──
 ```
 
 The service consumes reconciliation exceptions from Kafka and records a `PENDING`
-investigation for each. A recorded investigation can then be **run**: a language model
-requests evidence through four controlled tools, reasons over what comes back, and
-proposes an explanation — which the application checks against the evidence actually
-retrieved before accepting it.
+investigation for each. That investigation is then **run**: a language model requests
+evidence through four controlled tools, reasons over what comes back, and proposes an
+explanation — which the application checks against the evidence actually retrieved
+before accepting it.
+
+With `RECONAI_AGENT_AUTO_INVESTIGATE` enabled, consuming the event also *starts* the
+investigation — no one has to ask for it. The consumer records the investigation, commits
+the Kafka offset, and hands the run to a bounded background task, so provider latency
+never blocks consumption and a failed investigation never stops the consumer. With the
+flag off (the default) the service behaves as it always did: the investigation is recorded
+`PENDING` and waits for `POST /investigations/{id}/run`.
+
+Automation changes who starts an investigation and nothing else. The tool allowlist,
+the evidence ledger, citation grounding, the structured-result contract, the deterministic
+guardrail and human review are identical either way.
+
+### The structured-result contract
+
+The final answer is a tool call, so a result arrives as structured data rather than prose
+to be scraped. The JSON Schema handed to the provider is generated from the same module as
+`InvestigationResult`, sharing its enums and length bounds, so the two cannot silently
+disagree.
+
+**A tool `input_schema` is guidance to the model, not an API-side validator.** Investigation
+INV-1004 invoked the final tool without `confidence` while `confidence` was already listed
+as required. `InvestigationResult` is the only acceptance boundary, and it stays strict:
+`extra="forbid"`, every field required, enum domains closed, confidence in 0.0–1.0, both
+narratives capped, `requiresHumanApproval` pinned true.
+
+When a submission fails validation the model gets **exactly one** opportunity to submit a
+complete corrected result:
+
+```
+submit  ──▶ Pydantic ──▶ valid ──▶ grounding ──▶ guardrail ──▶ human
+              │
+              └─ invalid ──▶ safe field-level feedback ──▶ ONE resubmission
+                                                             │
+                                                  valid ─────┤──▶ grounding ──▶ ...
+                                                  invalid ───┴──▶ FAILED
+```
+
+The feedback carries the offending field names and reasons and nothing else — no part of
+the rejected payload, no narrative, no evidence content. **The application never fills in a
+missing field**; the model submits a complete replacement or the investigation fails. A
+corrected result is validated by the same model and checked against the same evidence
+ledger, so a correction is not an amnesty: a fabricated citation still fails.
+
+The correction is another provider call and consumes another unit of the shared AI budget.
+If the budget has no room for it, no correction call is made and the investigation is
+recorded **FAILED** — the run happened, tools were called and the model produced an
+unusable conclusion, so "not yet run" would be false about all of it.
+
+Citation grounding is deliberately **not** repairable. A malformed message is a badly
+formed message; a citation to evidence no tool returned is a claim that was not true, and
+offering to correct it would invite a second guess at which identifier sounds plausible.
 
 The result is **durably stored**, a **deterministic guardrail** routes it to a human or
 escalates it, a **human decides**, and every step lands in an **append-only audit trail**.
@@ -113,6 +164,45 @@ locally, so the service starts with nothing set.
 | `RECONAI_AGENT_PROMPT_VERSION` | `v1` | recorded on every recommendation |
 | `RECONAI_AGENT_REVIEW_CONFIDENCE_THRESHOLD` | `0.85` | guardrail: minimum confidence for human review |
 | `RECONAI_AGENT_REVIEW_MINIMUM_EVIDENCE` | `1` | guardrail: minimum verified evidence references |
+| `RECONAI_AGENT_RUN_PER_CLIENT_LIMIT` | `3` | provider runs per client per window |
+| `RECONAI_AGENT_RUN_GLOBAL_LIMIT` | `25` | provider runs per window across all callers — the spend ceiling |
+| `RECONAI_AGENT_RUN_WINDOW_SECONDS` | `3600` | length of the rate-limit window |
+| `RECONAI_AGENT_AUTO_INVESTIGATE` | `false` | start an investigation automatically on a Kafka exception |
+| `RECONAI_AGENT_AUTO_INVESTIGATE_CONCURRENCY` | `2` | in-flight automatic investigations |
+| `RECONAI_AGENT_AUTO_INVESTIGATE_MAX_ATTEMPTS` | `2` | attempts per event on provider failure |
+| `RECONAI_AGENT_AUTO_INVESTIGATE_DRAIN_SECONDS` | `10.0` | shutdown wait for in-flight investigations |
+
+**Running an investigation is the only operation here that spends money**, so it is rate
+limited. One limiter governs manual runs, automatic runs and the single structured-result
+correction — the global limit is the real ceiling, and every provider attempt consumes
+another unit of it.
+
+When the budget is exhausted before a run starts, no provider call is made and the
+investigation stays `PENDING`, which is both true and recoverable: `PENDING` is the only
+status a run may start from. The reason is recorded as `INVESTIGATION_AUTO_RUN_PAUSED`
+with `reason: AI_BUDGET_EXHAUSTED`.
+
+**A paused investigation does not resume on its own.** Automatic execution is scheduled
+only when consuming a Kafka event *creates* an investigation, so nothing revisits it when
+the limiter window resets, and a Kafka redelivery deliberately does not reschedule it.
+`POST /investigations/{id}/run` is the recovery path. That endpoint is an operator tool and
+is **not** exposed as a public UI action; V1 has no scheduler, no delayed queue and no
+poller, and adding one would be building job infrastructure this project does not need.
+
+### Operational audit events
+
+Two event types describe what happened to a *run* rather than what an investigation
+concluded. Neither is terminal, and neither is a failure:
+
+| Event | Meaning | Metadata |
+|---|---|---|
+| `INVESTIGATION_RETRY_SCHEDULED` | A provider failure released `RUNNING` → `PENDING` and another attempt follows. Written only when one genuinely does. | attempt, max_attempts, backoff_seconds, failure_category |
+| `INVESTIGATION_AUTO_RUN_PAUSED` | Automatic execution stopped without a conclusion and none is scheduled. | reason (`AI_BUDGET_EXHAUSTED` or `PROVIDER_UNAVAILABLE`), plus counters |
+
+Neither carries a provider error string: a provider message can embed request detail, and
+this table's stated guarantee is that it holds no sensitive payload. The exception class is
+recorded instead. Adding these needed no migration — `event_type` is a plain `VARCHAR(50)`
+with no `CHECK` constraint.
 
 The provider defaults to `none`. The service runs, consumes Kafka and records
 investigations with no model configured at all; only the investigation endpoint is
@@ -1048,7 +1138,8 @@ Absent by design:
 - **Any write to the financial core.** Approval records a judgement; it does not resolve
   an exception, adjust a settlement, or move money. No code path here can.
 - **Automatic approval or autonomous action of any kind.** The guardrail routes; it never
-  decides. Only a human transition reaches `COMPLETED`.
+  decides. Only a human transition reaches `COMPLETED`. Investigation now *starts*
+  automatically when an exception arrives; what the recommendation leads to does not.
 - **Retrying a failed or stuck investigation.** A `FAILED` one stays failed and a crashed
   one stays `RUNNING`. There is no scheduler, no background worker, no retry queue and no
   distributed lock. Recovery is a deliberate operational act, which is the honest

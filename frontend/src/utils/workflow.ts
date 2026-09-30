@@ -113,6 +113,12 @@ export function describeAuditEvent(event: AuditEvent): string {
       return "A human accepted the explanation.";
     case "REVIEW_REJECTED":
       return "A human did not accept the explanation.";
+    // Operational, and deliberately worded so neither reads as a failure: the
+    // investigation is back to PENDING in both cases.
+    case "INVESTIGATION_RETRY_SCHEDULED":
+      return "The model provider could not be reached; another attempt was scheduled.";
+    case "INVESTIGATION_AUTO_RUN_PAUSED":
+      return "Automatic investigation stopped without a conclusion; the exception is still queued.";
     default:
       return "";
   }
@@ -154,6 +160,69 @@ export function guardrailReasonFrom(events: AuditEvent[]): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Why a failed investigation failed, as the system recorded it at the time.
+ *
+ * Read from the audit trail rather than guessed at in the UI. The FAILED notice
+ * previously asserted a cause — "the evidence did not support a conclusion, or a
+ * cited reference could not be verified" — which is wrong for a malformed
+ * structured result and wrong for a provider outage. INV-1004 was neither of the
+ * two things the page claimed.
+ *
+ * Same shape as `guardrailReasonFrom`: the authoritative reason is already in
+ * `INVESTIGATION_FAILED`'s metadata, so no new endpoint is needed.
+ */
+export function failureDetailFrom(events: AuditEvent[]): string | null {
+  for (const event of events) {
+    if (event.event_type !== "INVESTIGATION_FAILED") continue;
+    const detail = event.metadata?.["detail"];
+    if (typeof detail === "string" && detail.trim() !== "") return detail;
+  }
+  return null;
+}
+
+/**
+ * Why automatic execution stopped without a conclusion, if it did.
+ *
+ * Derived from the audit trail, never guessed from how long an investigation
+ * has sat PENDING — elapsed time says nothing about the cause, and a page that
+ * inferred one would eventually say something false.
+ *
+ * Returns the reason code as recorded: `AI_BUDGET_EXHAUSTED` or
+ * `PROVIDER_UNAVAILABLE`. Null means nothing paused, which is the normal case.
+ */
+export function autoRunPausedReasonFrom(events: AuditEvent[]): string | null {
+  // Newest-relevant wins: an investigation can pause, be recovered, and pause
+  // again, and the latest pause is the one that explains the current state.
+  for (const event of events.slice().reverse()) {
+    if (event.event_type !== "INVESTIGATION_AUTO_RUN_PAUSED") continue;
+    const reason = event.metadata?.["reason"];
+    if (typeof reason === "string" && reason.trim() !== "") return reason;
+  }
+  return null;
+}
+
+/** The failure's exception class, for readers who want the category. */
+export function failureTypeFrom(events: AuditEvent[]): string | null {
+  for (const event of events) {
+    if (event.event_type !== "INVESTIGATION_FAILED") continue;
+    const type = event.metadata?.["failure_type"];
+    if (typeof type === "string" && type.trim() !== "") return type;
+  }
+  return null;
+}
+
+/**
+ * True while the investigation may still change state on its own.
+ *
+ * PENDING counts: with automatic execution an investigation left PENDING is
+ * waiting for a scheduled run or for the AI budget window to reset, so a client
+ * watching it should keep watching.
+ */
+export function isSettled(status: InvestigationStatus): boolean {
+  return isTerminal(status) || status === "AWAITING_REVIEW";
 }
 
 /** Counts per status, derived client-side from the list the backend returns. */

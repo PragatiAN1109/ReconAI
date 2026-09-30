@@ -7,8 +7,11 @@ disagree. An investigation may later say ``PROCESSOR_FEE`` — here is why. The
 first is a fact; the second is a conclusion requiring evidence and human review.
 """
 
+import json
+from collections.abc import Mapping
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -18,6 +21,14 @@ from app.events import ExceptionType
 # rejected rather than ignored. A model inventing an extra field is exactly the
 # drift worth hearing about.
 _STRICT = ConfigDict(extra="forbid", populate_by_name=True, frozen=True)
+
+#: Upper bound on the two free-text fields a result carries.
+#:
+#: Declared here rather than inline so the Pydantic constraint and the JSON
+#: Schema handed to the provider are the same number by construction. INV-1004
+#: was caused by the two contracts disagreeing; a shared constant is the cheapest
+#: way to stop that particular disagreement recurring.
+NARRATIVE_MAX_LENGTH = 2000
 
 
 class RootCauseClassification(StrEnum):
@@ -107,10 +118,12 @@ class InvestigationResult(BaseModel):
     model_config = _STRICT
 
     classification: RootCauseClassification
-    root_cause: str = Field(alias="rootCause", min_length=1, max_length=2000)
+    root_cause: str = Field(alias="rootCause", min_length=1, max_length=NARRATIVE_MAX_LENGTH)
     confidence: float = Field(ge=0.0, le=1.0)
     evidence: list[EvidenceReference] = Field(default_factory=list)
-    recommended_action: str = Field(alias="recommendedAction", min_length=1, max_length=2000)
+    recommended_action: str = Field(
+        alias="recommendedAction", min_length=1, max_length=NARRATIVE_MAX_LENGTH
+    )
     requires_human_approval: bool = Field(default=True, alias="requiresHumanApproval")
 
     @field_validator("requires_human_approval")
@@ -147,6 +160,110 @@ class InvestigationResult(BaseModel):
         here is about reproducibility, and says nothing about its meaning.
         """
         return Decimal(str(self.confidence)).quantize(Decimal("0.0001"))
+
+
+def _enum_values(enum_class: type[StrEnum]) -> list[str]:
+    """The enum's members as strings, in declaration order.
+
+    Generated rather than written out, so adding a classification cannot leave
+    the provider's schema listing a stale set.
+    """
+    return [member.value for member in enum_class]
+
+
+def result_input_schema() -> dict[str, Any]:
+    """The JSON Schema for a final investigation result.
+
+    Lives beside :class:`InvestigationResult` deliberately. This schema and that
+    model describe the same contract to two different audiences — the provider
+    and this application — and INV-1004 happened because they disagreed. Keeping
+    them in one file, sharing one length constant and generating both enum
+    domains from the enums themselves removes the classes of disagreement that
+    a reader could not spot.
+
+    Property names are the **aliases**, because that is what a model is asked to
+    produce. ``populate_by_name`` means the model also accepts the snake_case
+    field names, so this schema is narrower than Pydantic on that axis only —
+    which is the safe direction.
+
+    ``section`` is ``["string", "null"]`` rather than ``"string"``: Pydantic
+    accepts an explicit ``null`` there, and a schema that refused one would be
+    stricter than the contract it describes.
+
+    **What this schema cannot do.** ``required`` is instruction to the model, not
+    an API-side validator — INV-1004 omitted ``confidence`` while ``confidence``
+    was already listed as required. Treat every constraint here as making a
+    malformed result unlikely, never impossible. :class:`InvestigationResult` is
+    the enforcement boundary and is the only one that actually rejects.
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "classification": {
+                "type": "string",
+                "enum": _enum_values(RootCauseClassification),
+            },
+            "rootCause": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": NARRATIVE_MAX_LENGTH,
+            },
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "evidence": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "sourceType": {
+                            "type": "string",
+                            "enum": _enum_values(EvidenceSource),
+                        },
+                        "reference": {"type": "string", "minLength": 1},
+                        "section": {"type": ["string", "null"]},
+                    },
+                    "required": ["sourceType", "reference"],
+                },
+            },
+            "recommendedAction": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": NARRATIVE_MAX_LENGTH,
+            },
+            # Only true is valid. The Pydantic validator refuses false outright;
+            # this states the same thing to the model rather than letting it
+            # produce a result that is rejected after the fact.
+            "requiresHumanApproval": {"type": "boolean", "enum": [True]},
+        },
+        "required": [
+            "classification",
+            "rootCause",
+            "confidence",
+            "evidence",
+            "recommendedAction",
+            "requiresHumanApproval",
+        ],
+    }
+
+
+def describe_payload(payload: Mapping[str, Any] | None) -> str:
+    """A log-safe fingerprint of a submitted result.
+
+    Two scalars only. ``classification`` and ``confidence`` are enough to
+    identify which conclusion was rejected and are not themselves financial
+    detail; ``rootCause``, ``recommendedAction`` and the evidence list are
+    deliberately excluded because they are.
+
+    Reports the keys as ``null`` when absent, which is the useful signal when a
+    required field was the thing missing — as it was for INV-1004.
+    """
+    if payload is None:
+        return "null"
+    return json.dumps(
+        {key: payload.get(key) for key in ("classification", "confidence")},
+        default=str,
+    )
 
 
 def difference(expected: Decimal, settled: Decimal) -> Decimal:
