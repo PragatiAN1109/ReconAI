@@ -29,8 +29,10 @@ to be destroyed cleanly afterwards.
 │ ONE viewer-request function:             │          └───────────┘
 │  · /api/core → /api/v1                   │
 │  · /api/investigation → /api/v1          │
+│  · SPA fallback (non-API only)           │
 │ origin header: X-Origin-Verify           │
 │ /api/core/* = GET,HEAD only              │
+│ /api/core/demo/reconcile = +POST (exact) │
 └───┬──────────────────────────┬───────────┘
     │ default                  │ /api/*
     ▼                          ▼

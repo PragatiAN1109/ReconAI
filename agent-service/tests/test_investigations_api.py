@@ -57,6 +57,12 @@ class FakeInvestigationService:
     async def list_all(self) -> list[object]:
         return self._investigations
 
+    async def find_by_exception_id(self, exception_id: str) -> object | None:
+        return next(
+            (found for found in self._investigations if found.exception_id == exception_id),
+            None,
+        )
+
     async def get_recommendation(self, investigation_id: str) -> object | None:
         return self.recommendation
 
@@ -219,6 +225,58 @@ def app_with(settings: Settings, **state) -> TestClient:
     return TestClient(app)
 
 
+# ---------------------------------------------------------------------------
+# Discovering an investigation by the exception that caused it
+# ---------------------------------------------------------------------------
+
+
+def test_filtering_by_exception_id_returns_only_that_investigation(api: TestClient) -> None:
+    response = api.get("/api/v1/investigations", params={"exception_id": "EX-1006"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert body["items"][0]["investigation_id"] == "INV-1001"
+    assert body["items"][0]["exception_id"] == "EX-1006"
+
+
+def test_an_exception_with_no_investigation_yet_is_an_empty_list_not_a_404(
+    api: TestClient,
+) -> None:
+    """The window between reconciling and consuming the event is normal.
+
+    A client polling for its investigation has to be able to tell "not yet"
+    from "something is wrong", so this is 200 with nothing in it.
+    """
+    response = api.get("/api/v1/investigations", params={"exception_id": "EX-9999"})
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "total": 0}
+
+
+def test_omitting_the_filter_still_returns_everything(api: TestClient) -> None:
+    response = api.get("/api/v1/investigations")
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+
+
+def test_an_overlong_exception_id_is_rejected_rather_than_queried(api: TestClient) -> None:
+    response = api.get("/api/v1/investigations", params={"exception_id": "E" * 51})
+
+    assert response.status_code == 422
+
+
+def test_the_filter_is_read_only(api: TestClient) -> None:
+    # The collection route accepts no writes, filtered or otherwise.
+    assert api.post("/api/v1/investigations", json={}).status_code == 405
+
+
+# ---------------------------------------------------------------------------
+# Running an investigation
+# ---------------------------------------------------------------------------
+
+
 def test_running_without_a_configured_model_reports_unavailable(api: TestClient) -> None:
     """No provider configured is a 503, not a crash and not a fabricated result."""
     response = api.post("/api/v1/investigations/INV-1001/run")
@@ -316,6 +374,142 @@ def test_a_failed_investigation_returns_no_result(settings: Settings) -> None:
     assert response.status_code == 422
     assert "FR-999" in response.json()["detail"]
     assert "classification" not in response.text
+
+
+# ---------------------------------------------------------------------------
+# Throttling the one operation that costs money
+# ---------------------------------------------------------------------------
+
+
+def throttled_settings(**overrides) -> Settings:
+    """Settings with a tiny run allowance, for exercising the limit itself."""
+    return Settings(
+        _env_file=None,
+        service_name="reconai-investigation-service",
+        environment="test",
+        host="127.0.0.1",
+        port=8000,
+        log_level="INFO",
+        **overrides,
+    )
+
+
+def test_running_past_the_per_client_limit_returns_429(settings: Settings) -> None:
+    workflow = FakeWorkflow(returns=outcome())
+
+    with app_with(
+        throttled_settings(run_per_client_limit=2, run_global_limit=100),
+        investigation_workflow=workflow,
+    ) as client:
+        assert client.post("/api/v1/investigations/INV-1001/run").status_code == 200
+        assert client.post("/api/v1/investigations/INV-1001/run").status_code == 200
+        response = client.post("/api/v1/investigations/INV-1001/run")
+
+    assert response.status_code == 429
+    assert "retry" in response.json()["detail"].lower()
+
+
+def test_a_throttled_run_never_reaches_the_workflow(settings: Settings) -> None:
+    """The whole point: a refused run must not call the paid provider.
+
+    The workflow is what performs the model call, so counting its invocations
+    is the assertion that matters for cost.
+    """
+    workflow = FakeWorkflow(returns=outcome())
+
+    with app_with(
+        throttled_settings(run_per_client_limit=1, run_global_limit=100),
+        investigation_workflow=workflow,
+    ) as client:
+        client.post("/api/v1/investigations/INV-1001/run")
+        client.post("/api/v1/investigations/INV-1001/run")
+        client.post("/api/v1/investigations/INV-1001/run")
+
+    assert len(workflow.calls) == 1
+
+
+def test_the_global_limit_refuses_even_a_fresh_client(settings: Settings) -> None:
+    workflow = FakeWorkflow(returns=outcome())
+
+    with app_with(
+        throttled_settings(run_per_client_limit=100, run_global_limit=1),
+        investigation_workflow=workflow,
+    ) as client:
+        assert (
+            client.post(
+                "/api/v1/investigations/INV-1001/run",
+                headers={"X-Forwarded-For": "1.1.1.1"},
+            ).status_code
+            == 200
+        )
+        response = client.post(
+            "/api/v1/investigations/INV-1001/run",
+            headers={"X-Forwarded-For": "2.2.2.2"},
+        )
+
+    assert response.status_code == 429
+    assert "overall limit" in response.json()["detail"]
+
+
+def test_a_throttled_response_says_when_to_retry(settings: Settings) -> None:
+    workflow = FakeWorkflow(returns=outcome())
+
+    with app_with(
+        throttled_settings(run_per_client_limit=1, run_window_seconds=120),
+        investigation_workflow=workflow,
+    ) as client:
+        client.post("/api/v1/investigations/INV-1001/run")
+        response = client.post("/api/v1/investigations/INV-1001/run")
+
+    assert response.status_code == 429
+    assert int(response.headers["Retry-After"]) > 0
+
+
+def test_the_limit_is_keyed_on_the_forwarded_client_address(settings: Settings) -> None:
+    # Behind CloudFront and an ALB every request shares a socket address, so
+    # without this the first visitor would exhaust the allowance for everyone.
+    workflow = FakeWorkflow(returns=outcome())
+
+    with app_with(
+        throttled_settings(run_per_client_limit=1, run_global_limit=100),
+        investigation_workflow=workflow,
+    ) as client:
+        first = client.post(
+            "/api/v1/investigations/INV-1001/run", headers={"X-Forwarded-For": "1.1.1.1"}
+        )
+        again = client.post(
+            "/api/v1/investigations/INV-1001/run", headers={"X-Forwarded-For": "1.1.1.1"}
+        )
+        other = client.post(
+            "/api/v1/investigations/INV-1001/run", headers={"X-Forwarded-For": "9.9.9.9"}
+        )
+
+    assert first.status_code == 200
+    assert again.status_code == 429
+    assert other.status_code == 200
+
+
+def test_throttling_does_not_apply_to_reads(settings: Settings) -> None:
+    """Only the paid operation is limited. Browsing the console is not."""
+    with app_with(throttled_settings(run_per_client_limit=1, run_global_limit=1)) as client:
+        for _ in range(5):
+            assert client.get("/api/v1/investigations").status_code == 200
+            assert client.get("/api/v1/investigations/INV-1001").status_code == 200
+
+
+def test_throttling_does_not_apply_to_human_review(settings: Settings) -> None:
+    # A human decision costs nothing and must never be blocked by an AI budget.
+    with app_with(
+        throttled_settings(run_per_client_limit=1, run_global_limit=1),
+        reviews=FakeReviewService(),
+    ) as client:
+        client.post("/api/v1/investigations/INV-1001/run")  # consumes the allowance
+
+        response = client.post(
+            "/api/v1/investigations/INV-1001/approve", json={"reviewed_by": "ops.analyst"}
+        )
+
+    assert response.status_code != 429
 
 
 # ---------------------------------------------------------------------------

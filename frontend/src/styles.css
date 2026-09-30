@@ -536,3 +536,90 @@ button.metric:hover { border-color: var(--border-strong); }
 .section-note { font-size: 12.5px; color: var(--text-muted); margin: 0 0 12px; }
 .prose { margin: 0; white-space: pre-wrap; }
 .stack > * + * { margin-top: 14px; }
+
+/* ------------------------------------------- reconciliation playground --- */
+
+/*
+ * The playground dialog is wider than the review-confirmation one: it holds a
+ * JSON editor, and 460px would wrap every line of it.
+ */
+.dialog-wide { max-width: 620px; }
+.dialog-wide .dialog-body { max-height: 70vh; overflow-y: auto; }
+
+.scenario-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.chip {
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.chip:hover:not(:disabled) { background: var(--surface-sunken); }
+.chip.is-active {
+  border-color: var(--accent, var(--positive));
+  background: var(--surface-sunken);
+  font-weight: 600;
+}
+.chip:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Monospaced and resizable: it holds hand-edited JSON, not prose. */
+.code-editor {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-sunken);
+  color: var(--text);
+  resize: vertical;
+}
+.code-editor:disabled { opacity: 0.6; }
+
+.field-error { font-size: 11.5px; color: var(--danger); margin-top: 4px; }
+
+.discovery { margin-top: 10px; }
+
+/* Header with a trailing action. The title block keeps its own flow. */
+.page-head-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.page-head-row .page-subtitle { margin-bottom: 0; }
+
+/* ------------------------------------------------ run AI investigation --- */
+
+/*
+ * Visually set apart from the surrounding card: this is the one action in the
+ * console that crosses from deterministic, free work into a paid model call, and
+ * it should not look like an ordinary button in a list of them.
+ */
+.run-ai {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: var(--surface-sunken);
+}
+.run-ai-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.run-ai-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.run-ai .notice { margin-top: 12px; margin-bottom: 0; }

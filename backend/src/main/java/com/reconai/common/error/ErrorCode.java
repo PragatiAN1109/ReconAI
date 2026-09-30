@@ -21,7 +21,19 @@ public enum ErrorCode {
      * the deterministic financial core raises it: reconciliation has no dependency that
      * can be unavailable. It exists so the contract's categories are complete.
      */
-    DEPENDENCY_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE);
+    DEPENDENCY_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE),
+
+    /**
+     * The request body is larger than an endpoint accepts. Raised only by the public
+     * demo endpoint, which bounds its input before reading it.
+     */
+    PAYLOAD_TOO_LARGE(HttpStatus.PAYLOAD_TOO_LARGE),
+
+    /**
+     * Too many requests in the current window. Raised only by the public demo
+     * endpoint, which is reachable without authentication and so is throttled.
+     */
+    RATE_LIMITED(HttpStatus.TOO_MANY_REQUESTS);
 
     private final HttpStatus httpStatus;
 

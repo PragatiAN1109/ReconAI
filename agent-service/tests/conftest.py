@@ -107,6 +107,14 @@ def settings() -> Settings:
         host="127.0.0.1",
         port=8000,
         log_level="INFO",
+        # The run limiter is one object per app, and every TestClient request
+        # presents the same client key. Production defaults (3 per client per
+        # hour) would throttle a module partway through and make failures depend
+        # on test order. Raised here so no ordinary test is ever limited; the
+        # limiter is covered by tests/test_rate_limit.py with a fake clock and by
+        # a dedicated API test that lowers these explicitly.
+        run_per_client_limit=10_000,
+        run_global_limit=10_000,
     )
 
 

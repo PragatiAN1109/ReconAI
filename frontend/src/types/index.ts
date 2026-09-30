@@ -73,6 +73,61 @@ export interface TransactionSettlements {
 }
 
 // ---------------------------------------------------------------------------
+// Demo reconciliation playground (Financial Core)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the console sends for a synthetic run.
+ *
+ * Amounts are strings, not numbers, so a decimal typed by hand survives the
+ * round trip exactly. `2500.00` as a JSON number is a double before it is ever
+ * a BigDecimal; as a string it is parsed once, by the server, at full precision.
+ *
+ * Only these fields exist. Identity, merchant, processor, statuses, types and
+ * timestamps are the server's, and a value supplied for any of them is ignored.
+ */
+export interface DemoTransactionInput {
+  amount: string;
+  expectedSettlementAmount: string;
+  currency: string;
+}
+
+export interface DemoSettlementInput {
+  settledAmount: string;
+  currency: string;
+}
+
+/** An empty `settlements` array is how MISSING_SETTLEMENT is expressed. */
+export interface DemoReconcileRequest {
+  transaction: DemoTransactionInput;
+  settlements: DemoSettlementInput[];
+}
+
+/** One discrepancy, exactly as the deterministic engine reported it. */
+export interface ReconciledException {
+  exceptionId: string;
+  exceptionType: ExceptionType;
+  expectedValue: string | null;
+  observedValue: string | null;
+  differenceAmount: number | null;
+  currency: string | null;
+  status: ExceptionStatus;
+}
+
+export interface ReconciliationResult {
+  transactionId: string;
+  reconciled: boolean;
+  exceptions: ReconciledException[];
+  reconciledAt: string;
+}
+
+export interface DemoReconcileResponse {
+  transactionId: string;
+  settlementIds: string[];
+  reconciliation: ReconciliationResult;
+}
+
+// ---------------------------------------------------------------------------
 // Investigation Service (Python) — the AI lifecycle
 // ---------------------------------------------------------------------------
 
@@ -144,6 +199,21 @@ export interface Recommendation {
   prompt_version: string | null;
   created_at: string;
   evidence: Evidence[];
+}
+
+/**
+ * The result of running an AI investigation.
+ *
+ * `guardrail_reason` is written by deterministic application code, not by the
+ * model, which is why it can be shown as an explanation of the routing rather
+ * than as another model claim.
+ */
+export interface RunResult {
+  investigation_id: string;
+  status: InvestigationStatus;
+  guardrail_reason: string;
+  recommendation: Recommendation;
+  evidence_retrieved: Record<string, string[]>;
 }
 
 export type ReviewDecision = "APPROVED" | "REJECTED" | "ESCALATED";

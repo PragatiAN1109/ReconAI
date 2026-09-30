@@ -13,6 +13,7 @@ import {
   getAuditTrail,
   getInvestigation,
   getRecommendation,
+  runInvestigation,
 } from "../api/investigations";
 import { getException, getSettlements, getTransaction } from "../api/financialCore";
 import { ApiError } from "../api/client";
@@ -37,6 +38,7 @@ import { AuditTimeline } from "../components/AuditTimeline";
 import { EvidenceList } from "../components/Evidence";
 import { ReviewPanel } from "../components/ReviewPanel";
 import { ErrorPanel, LoadingPanel, Notice } from "../components/StateViews";
+import { RunAiInvestigationPanel } from "../components/RunAiInvestigationPanel";
 
 /**
  * One investigation, end to end.
@@ -230,6 +232,16 @@ export function InvestigationDetailPage() {
                   ? "The investigation is running. No conclusion has been stored yet."
                   : "No recommendation was stored for this investigation."}
             </p>
+            {/* Only for PENDING. Every other status either has a result, is
+                mid-flight, or has been decided — and the backend refuses a
+                second run with 409 in all of them. */}
+            {investigation.status === "PENDING" && (
+              <RunAiInvestigationPanel
+                investigationId={investigation.investigation_id}
+                onRun={() => runInvestigation(investigation.investigation_id)}
+                onCompleted={() => void load()}
+              />
+            )}
           </div>
         </section>
       )}

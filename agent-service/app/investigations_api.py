@@ -16,8 +16,9 @@ an access-controlled system.
 import logging
 from datetime import datetime
 from decimal import Decimal
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 
 from app.investigation_agent import InvestigationFailed
@@ -35,6 +36,7 @@ from app.models import (
     Review,
     ReviewDecision,
 )
+from app.rate_limit import Decision
 from app.review_service import AlreadyReviewed, NotAwaitingReview
 from app.review_service import InvestigationNotFound as ReviewInvestigationNotFound
 
@@ -280,7 +282,37 @@ class AuditListResponse(BaseModel):
 
 
 @router.get("", response_model=InvestigationListResponse, summary="List investigations")
-async def list_investigations(request: Request) -> InvestigationListResponse:
+async def list_investigations(
+    request: Request,
+    exception_id: Annotated[
+        str | None,
+        Query(
+            max_length=50,
+            description=(
+                "Return only the investigation recorded for this exception. An empty "
+                "list means none exists yet, which is the expected answer while the "
+                "event is still in flight."
+            ),
+        ),
+    ] = None,
+) -> InvestigationListResponse:
+    """Every investigation, newest first, or just the one for an exception.
+
+    The filter exists for a client that has caused an exception and is waiting
+    for its investigation to appear. Polling the whole collection to find one
+    row would get slower with every row ever created; this stays one lookup on a
+    unique column.
+
+    An unknown ``exception_id`` is an empty list, not a 404: "no investigation
+    yet" is a normal stage of the lifecycle, not a missing resource.
+    """
+    if exception_id is not None:
+        investigation = await request.app.state.investigations.find_by_exception_id(
+            exception_id
+        )
+        items = [] if investigation is None else [InvestigationResponse.of(investigation)]
+        return InvestigationListResponse(items=items, total=len(items))
+
     investigations = await request.app.state.investigations.list_all()
     items = [InvestigationResponse.of(investigation) for investigation in investigations]
     return InvestigationListResponse(items=items, total=len(items))
@@ -348,12 +380,43 @@ async def get_audit_trail(request: Request, investigation_id: str) -> AuditListR
 # ---------------------------------------------------------------------------
 
 
+def _client_key(request: Request) -> str:
+    """Best-effort caller identity for throttling.
+
+    In the deployed stack every request arrives through CloudFront and an ALB,
+    so ``request.client`` is the load balancer and useless as a key. The
+    leftmost ``X-Forwarded-For`` entry is the viewer address.
+
+    A caller can set that header, so this identifies a caller only as well as a
+    throttle for a public demo needs to. The global limit is what actually caps
+    spend and cannot be sidestepped this way.
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        first = forwarded.split(",", 1)[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else "unknown"
+
+
+def _throttle_detail(decision: Decision, retry_after: int) -> str:
+    shared = f" This is a shared public demo; please retry in {retry_after}s."
+    if decision is Decision.GLOBAL_LIMIT_REACHED:
+        return (
+            "The demo has reached its overall limit for AI investigation runs in this "
+            "window." + shared
+        )
+    return "You have reached the limit for AI investigation runs in this window." + shared
+
+
 @router.post(
     "/{investigation_id}/run",
     response_model=RunResponse,
     summary="Run an investigation and record its outcome",
 )
-async def run_investigation(request: Request, investigation_id: str) -> RunResponse:
+async def run_investigation(
+    request: Request, investigation_id: str, response: Response
+) -> RunResponse:
     """Investigate one exception, store the result, and route it for review.
 
     Investigation only. It does not approve anything, does not write to the
@@ -362,6 +425,11 @@ async def run_investigation(request: Request, investigation_id: str) -> RunRespo
 
     Runnable once. A second call while the first is running, or after a result
     exists, is refused with 409 rather than producing a second conclusion.
+
+    This is the only operation in ReconAI that spends money, and this service is
+    public and unauthenticated, so it is throttled before any provider call is
+    made. A refused run does not touch the investigation: nothing is recorded,
+    no status changes, and the caller can try again in the next window.
     """
     workflow = request.app.state.investigation_workflow
     if workflow is None:
@@ -371,6 +439,19 @@ async def run_investigation(request: Request, investigation_id: str) -> RunRespo
                 "No investigation model is configured. Set RECONAI_AGENT_LLM_PROVIDER "
                 "and RECONAI_AGENT_LLM_API_KEY."
             ),
+        )
+
+    # Checked before the workflow is entered, so a throttled request costs
+    # nothing — no database transaction, no status transition, no provider call.
+    limiter = request.app.state.run_limiter
+    decision = limiter.check(_client_key(request))
+    if decision is not Decision.ALLOWED:
+        retry_after = limiter.seconds_until_reset()
+        response.headers["Retry-After"] = str(retry_after)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=_throttle_detail(decision, retry_after),
+            headers={"Retry-After": str(retry_after)},
         )
 
     try:

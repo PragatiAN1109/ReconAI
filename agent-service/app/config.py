@@ -107,6 +107,17 @@ class Settings(BaseSettings):
     #: confident it claims to be.
     review_minimum_evidence: int = Field(default=1, ge=0, le=20)
 
+    # Throttling for the run endpoint. Running an investigation is the only
+    # operation here that costs money, and the deployed console is public and
+    # unauthenticated, so the endpoint is capped. The global limit is the actual
+    # spend ceiling; the per-client limit stops one visitor exhausting it.
+    #
+    # Counted per process and keyed off a header a caller can set, so this is a
+    # cost control rather than a security boundary. See app/rate_limit.py.
+    run_per_client_limit: int = Field(default=3, ge=1, le=10_000)
+    run_global_limit: int = Field(default=25, ge=1, le=100_000)
+    run_window_seconds: int = Field(default=3600, ge=1, le=86_400)
+
     @property
     def investigation_model_configured(self) -> bool:
         return self.llm_provider != "none" and self.llm_api_key is not None

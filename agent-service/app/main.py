@@ -39,6 +39,7 @@ from app.logging_config import configure_logging
 from app.investigation_agent import InvestigationAgent
 from app.investigation_model import InvestigationModel
 from app.policy_search import PolicySearch
+from app.rate_limit import FixedWindowRateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +199,13 @@ def create_app(
     app.state.investigation_workflow = investigation_workflow
     app.state.reviews = reviews
     app.state.audit = audit
+    # One limiter for the lifetime of the app, shared by every run request. The
+    # run endpoint is the only paid operation here and this service is public.
+    app.state.run_limiter = FixedWindowRateLimiter(
+        per_client_limit=settings.run_per_client_limit,
+        global_limit=settings.run_global_limit,
+        window_seconds=settings.run_window_seconds,
+    )
     app.include_router(health_router)
     app.include_router(investigations_router)
     return app

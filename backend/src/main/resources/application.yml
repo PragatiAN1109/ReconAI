@@ -46,6 +46,18 @@ reconai:
   kafka:
     reconciliation-exceptions-topic: ${RECONAI_KAFKA_EXCEPTIONS_TOPIC:reconciliation.exceptions}
 
+  # Bounds for the public demo reconciliation endpoint. It is the only write route
+  # reachable from the internet, so it is the only one that is throttled. These are
+  # nuisance and cost controls for a synthetic-data demo, not a security boundary:
+  # the limiter counts per process and keys off a header a caller can set.
+  demo:
+    max-request-bytes: ${RECONAI_DEMO_MAX_REQUEST_BYTES:4096}
+    per-client-limit: ${RECONAI_DEMO_PER_CLIENT_LIMIT:10}
+    global-limit: ${RECONAI_DEMO_GLOBAL_LIMIT:300}
+    window-seconds: ${RECONAI_DEMO_WINDOW_SECONDS:60}
+    merchant-id: ${RECONAI_DEMO_MERCHANT_ID:DEMO-MERCHANT}
+    processor: ${RECONAI_DEMO_PROCESSOR:DEMO-PROCESSOR}
+
 server:
   port: ${RECONAI_PORT:8080}
   error:

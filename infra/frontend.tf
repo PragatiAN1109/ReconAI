@@ -210,14 +210,48 @@ resource "aws_cloudfront_distribution" "main" {
     }
   }
 
+  # --- the one publicly writable route: the reconciliation playground ---
+  #
+  # MUST be declared before /api/core/* below. CloudFront evaluates ordered
+  # behaviours in order and takes the first pattern that matches, and the
+  # broader read-only behaviour would otherwise swallow this path and reject
+  # the POST.
+  #
+  # An exact path, not /api/core/demo/*. CloudFront does not accept arbitrary
+  # method subsets — allowed_methods must be one of [GET,HEAD],
+  # [GET,HEAD,OPTIONS] or the full seven — so permitting POST here also permits
+  # PUT, PATCH and DELETE at the edge. Naming one exact path is what keeps that
+  # blast radius to a single endpoint, where Spring implements only POST and
+  # answers 405 to everything else (DemoReconciliationController).
+  #
+  # The endpoint itself creates synthetic records with server-assigned
+  # identities and cannot amend or remove anything. See
+  # backend/.../demo/DemoReconciliationService.java.
+  ordered_cache_behavior {
+    path_pattern             = "/api/core/demo/reconcile"
+    target_origin_id         = local.alb_origin_id
+    viewer_protocol_policy   = "https-only"
+    allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods           = ["GET", "HEAD"]
+    cache_policy_id          = data.aws_cloudfront_cache_policy.caching_disabled.id
+    origin_request_policy_id = data.aws_cloudfront_origin_request_policy.all_viewer_except_host.id
+    compress                 = true
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.viewer_request.arn
+    }
+  }
+
   # --- Financial Core: READ ONLY ---
   #
-  # GET and HEAD only, which costs nothing functionally: the console is already
-  # read-only against the Financial Core (frontend/src/api/financialCore.ts
-  # imports only getOptional). It removes the ability to create transactions,
-  # settlements or trigger reconciliation through the browser, which is the
-  # cheapest demo-safety control available and matches the product's own
-  # boundary — the UI never writes to the financial core.
+  # GET and HEAD only, which costs nothing functionally: apart from the demo
+  # route above, the console is read-only against the Financial Core
+  # (frontend/src/api/financialCore.ts imports only getOptional). It removes the
+  # ability to create arbitrary transactions, settlements or reconciliation runs
+  # through the browser, which is the cheapest demo-safety control available and
+  # matches the product's own boundary — the UI never writes financial records
+  # except through the one validated, server-identified demo endpoint.
   ordered_cache_behavior {
     path_pattern             = "/api/core/*"
     target_origin_id         = local.alb_origin_id

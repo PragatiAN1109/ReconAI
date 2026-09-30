@@ -143,6 +143,20 @@ class InvestigationService:
             )
             return list(result)
 
+    async def find_by_exception_id(self, exception_id: str) -> Investigation | None:
+        """The investigation recorded for one exception, if there is one yet.
+
+        Exists so a client that has just caused an exception can discover the
+        investigation without fetching the whole collection. Kafka delivery and
+        consumption are asynchronous, so between a reconciliation returning and
+        the investigation appearing there is a window in which the honest answer
+        is "not yet" — hence ``None`` rather than an error.
+
+        ``exception_id`` is unique, so this is at most one row.
+        """
+        async with self._database.session() as session:
+            return await self._find_by_exception_id(session, exception_id)
+
     async def get_recommendation(self, investigation_id: str) -> Recommendation | None:
         """The AI's conclusion, if one has been recorded.
 

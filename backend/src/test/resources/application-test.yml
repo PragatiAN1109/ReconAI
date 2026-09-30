@@ -25,3 +25,13 @@ spring:
     producer:
       properties:
         max.block.ms: 1000
+
+reconai:
+  demo:
+    # The rate limiter is a singleton holding state across a context's lifetime, and
+    # MockMvc requests all present the same client key. Production defaults would throttle
+    # a test class partway through and make failures depend on test order. Raised here so
+    # ordinary tests are never limited; the limiter itself is tested by a dedicated class
+    # that lowers these with @TestPropertySource, and by a unit test with a fake clock.
+    per-client-limit: 100000
+    global-limit: 100000

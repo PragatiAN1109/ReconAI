@@ -6,6 +6,7 @@ import { listInvestigations } from "../api/investigations";
 import { formatShort } from "../utils/datetime";
 import { countByStatus, humanise, statusTone } from "../utils/workflow";
 import { Badge } from "../components/Badge";
+import { RunReconciliationModal } from "../components/RunReconciliationModal";
 import { EmptyPanel, ErrorPanel, SkeletonRows } from "../components/StateViews";
 
 /**
@@ -39,6 +40,7 @@ export function DashboardPage() {
   const [statusFilter, setStatusFilter] = useState<InvestigationStatus | "ALL">("ALL");
   const [typeFilter, setTypeFilter] = useState<ExceptionType | "ALL">("ALL");
   const [query, setQuery] = useState("");
+  const [playgroundOpen, setPlaygroundOpen] = useState(false);
 
   const load = useCallback(async () => {
     setError(null);
@@ -83,7 +85,7 @@ export function DashboardPage() {
   if (error !== null) {
     return (
       <div className="page">
-        <Header total={null} />
+        <Header total={null} onRunReconciliation={() => setPlaygroundOpen(true)} />
         <ErrorPanel error={error} onRetry={() => void load()} />
       </div>
     );
@@ -91,7 +93,21 @@ export function DashboardPage() {
 
   return (
     <div className="page">
-      <Header total={investigations?.length ?? null} />
+      <Header
+        total={investigations?.length ?? null}
+        onRunReconciliation={() => setPlaygroundOpen(true)}
+      />
+
+      {playgroundOpen && (
+        <RunReconciliationModal
+          onClose={() => {
+            setPlaygroundOpen(false);
+            // A run may have created an investigation. Reload so the queue
+            // reflects it without the visitor having to refresh the page.
+            void load();
+          }}
+        />
+      )}
 
       <div className="metrics">
         <button
@@ -223,14 +239,27 @@ export function DashboardPage() {
   );
 }
 
-function Header({ total }: { total: number | null }) {
+function Header({
+  total,
+  onRunReconciliation,
+}: {
+  total: number | null;
+  onRunReconciliation: () => void;
+}) {
   return (
-    <div className="page-head">
-      <h1 className="page-title">Exception queue</h1>
-      <p className="page-subtitle">
-        Discrepancies detected deterministically by the Financial Core.
-        {total !== null && ` ${total} investigation${total === 1 ? "" : "s"} on record.`}
-      </p>
+    <div className="page-head page-head-row">
+      <div>
+        <h1 className="page-title">Exception queue</h1>
+        <p className="page-subtitle">
+          Discrepancies detected deterministically by the Financial Core.
+          {total !== null && ` ${total} investigation${total === 1 ? "" : "s"} on record.`}
+        </p>
+      </div>
+      {/* In the header rather than the navigation: this is an action taken from
+          the queue, not a separate area of the console. */}
+      <button type="button" className="btn primary" onClick={onRunReconciliation}>
+        + Run Reconciliation
+      </button>
     </div>
   );
 }

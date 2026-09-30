@@ -67,6 +67,18 @@ describe("API prefix rewriting", () => {
   });
 });
 
+describe("the demo reconciliation write path", () => {
+  // The one publicly writable route. It has to reach the Financial Core under
+  // its real prefix, and it must not be mistaken for a client-side route.
+  it("rewrites to the Financial Core's own path", () => {
+    expect(route("/api/core/demo/reconcile")).toBe("/api/v1/demo/reconcile");
+  });
+
+  it("is never routed to the SPA shell", () => {
+    expect(route("/api/core/demo/reconcile")).not.toBe("/index.html");
+  });
+});
+
 describe("API paths are never replaced by the SPA shell", () => {
   // The regression that motivated this file. INV-1002 is FAILED and has no
   // recommendation, so the API answers 404 — and that 404 has to survive the
@@ -85,6 +97,7 @@ describe("API paths are never replaced by the SPA shell", () => {
       "/api/investigation/investigations/INV-1002/recommendation",
       "/api/investigation/investigations/INV-1002/audit",
       "/api/investigation/investigations/INV-1003/reject",
+      "/api/core/demo/reconcile",
       // Unrecognised /api/ paths still must not become the shell.
       "/api/something-else/deep/path",
       "/api/investigation",
