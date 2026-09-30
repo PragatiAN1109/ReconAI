@@ -7,21 +7,10 @@
 # The three behaviours mirror frontend/nginx.conf exactly, so the application's
 # API contract is byte-identical in Vite dev, Docker Compose and AWS.
 
-# --- Basic Auth credential -------------------------------------------------
-#
-# GENERATED, not supplied. A variable would have to be typed into tfvars, where
-# it risks being committed; generating it means no real credential exists in the
-# repository at any point. Read it after apply with:
-#   terraform output -raw basic_auth_password
-#
-# It does live in Terraform state, unavoidably: CloudFront Functions have no
-# network access, so the credential must be embedded in the function at deploy
-# time. Documented rather than hidden.
-
-resource "random_password" "basic_auth" {
-  length  = 24
-  special = false # avoids shell- and base64-hostile characters
-}
+# The distribution is deliberately open to the public internet. It serves
+# synthetic data only, and the demo exists to be looked at; an access prompt
+# defeated that. The ALB behind it is still unreachable except through
+# CloudFront, which the origin-verify header below enforces.
 
 # --- S3 --------------------------------------------------------------------
 
@@ -136,12 +125,10 @@ resource "aws_acm_certificate_validation" "main" {
 resource "aws_cloudfront_function" "viewer_request" {
   name    = "${local.name}-viewer-request"
   runtime = "cloudfront-js-2.0"
-  comment = "Basic Auth, Authorization stripping, and /api prefix rewriting"
+  comment = "/api prefix rewriting and SPA history fallback"
   publish = true
 
-  code = templatefile("${path.module}/functions/viewer-request.js.tftpl", {
-    basic_auth_b64 = base64encode("${var.basic_auth_username}:${random_password.basic_auth.result}")
-  })
+  code = file("${path.module}/functions/viewer-request.js")
 }
 
 # Managed policies, referenced by name rather than hardcoded ID.
@@ -264,22 +251,16 @@ resource "aws_cloudfront_distribution" "main" {
     }
   }
 
-  # SPA history fallback. /investigations/INV-1003 is a client-side route with
-  # no object behind it; S3 returns 403 through OAC (not 404), so both are
-  # mapped to the shell with a 200.
-  custom_error_response {
-    error_code            = 403
-    response_code         = 200
-    response_page_path    = "/index.html"
-    error_caching_min_ttl = 0
-  }
-
-  custom_error_response {
-    error_code            = 404
-    response_code         = 200
-    response_page_path    = "/index.html"
-    error_caching_min_ttl = 0
-  }
+  # NO custom_error_response here, deliberately.
+  #
+  # It is a distribution-WIDE setting — it cannot be scoped to a cache
+  # behaviour. Mapping 403/404 -> /index.html with a 200 also rewrote genuine
+  # API errors coming back from the ALB origin: a correct 404 from
+  # /api/investigation/investigations/{id}/recommendation arrived at the
+  # browser as 200 text/html and broke JSON parsing in the console.
+  #
+  # SPA history fallback now lives in the viewer-request function, which can
+  # tell the two path spaces apart. See functions/viewer-request.js.
 
   viewer_certificate {
     acm_certificate_arn = aws_acm_certificate.main.arn

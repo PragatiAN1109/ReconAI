@@ -73,6 +73,23 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   if (response.status === 204) {
     return undefined as T;
   }
+
+  // A 2xx that is not JSON means the response never reached the API at all —
+  // something in front of it answered instead. The symptom that motivated this
+  // check was a CloudFront SPA error-page rule rewriting a genuine API 404 into
+  // the HTML shell with a 200, which surfaced as "Unexpected token '<'" and
+  // named neither the URL nor the real status. Fail with something diagnosable.
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("json")) {
+    throw new ApiError(
+      response.status,
+      `Expected JSON from ${url} but received "${contentType || "an unknown content type"}". ` +
+        "The request was answered by something other than the API — check the " +
+        "CDN or proxy routing for this path.",
+      url,
+    );
+  }
+
   return (await response.json()) as T;
 }
 

@@ -90,19 +90,6 @@ output "console_url" {
   value       = "https://${var.domain_name}"
 }
 
-# --- Demo access ----------------------------------------------------------
-
-output "basic_auth_username" {
-  description = "Username for the CloudFront Basic Auth gate."
-  value       = var.basic_auth_username
-}
-
-output "basic_auth_password" {
-  description = "Generated password for the Basic Auth gate. Read with: terraform output -raw basic_auth_password"
-  value       = random_password.basic_auth.result
-  sensitive   = true
-}
-
 # --- Debugging ------------------------------------------------------------
 
 output "alb_dns_name" {

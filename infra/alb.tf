@@ -4,9 +4,9 @@
 # -----------------------
 # The ALB must be internet-facing for CloudFront to reach it (CloudFront cannot
 # reach an internal ALB without extra infrastructure). But every demo control —
-# Basic Auth, GET/HEAD-only on the Financial Core, path rewriting — lives in
-# CloudFront. Anyone who found the *.elb.amazonaws.com name could skip all of
-# it and POST directly to Spring.
+# GET/HEAD-only on the Financial Core, path rewriting — lives in CloudFront.
+# Anyone who found the *.elb.amazonaws.com name could skip all of it and POST
+# directly to Spring.
 #
 # THE FIX
 # -------

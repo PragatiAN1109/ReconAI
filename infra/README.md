@@ -27,8 +27,6 @@ to be destroyed cleanly afterwards.
 ┌──────────────────────────────────────────┐   CNAME  ┌───────────┐
 │ CloudFront + ACM                         │◄─────────│ Namecheap │
 │ ONE viewer-request function:             │          └───────────┘
-│  · Basic Auth                            │
-│  · strips Authorization                  │
 │  · /api/core → /api/v1                   │
 │  · /api/investigation → /api/v1          │
 │ origin header: X-Origin-Verify           │
@@ -282,7 +280,7 @@ aws ecs describe-services --cluster "$(terraform output -raw ecs_cluster)" --ser
 **Financial Core** — answers only after Flyway has migrated:
 
 ```bash
-curl -sS -u "reconai:$(terraform output -raw basic_auth_password)" "https://$(terraform output -raw console_url | sed 's#https://##')/api/core/exceptions"
+curl -sS "https://$(terraform output -raw console_url | sed 's#https://##')/api/core/exceptions"
 ```
 
 **Investigation Service readiness — the hard gate:**

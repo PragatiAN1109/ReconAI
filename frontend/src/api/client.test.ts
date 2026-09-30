@@ -81,6 +81,48 @@ describe("get", () => {
     expect(error).toBeInstanceOf(ApiError);
     expect((error as ApiError).status).toBe(502);
   });
+
+  // A CloudFront custom_error_response is distribution-wide and once rewrote a
+  // genuine API 404 into the SPA shell with a 200. The raw SyntaxError that
+  // produced ("Unexpected token '<'") named neither the URL nor the real
+  // status, so the console failed in a way nobody could diagnose from it.
+  it("rejects an HTML document served with a 200 instead of parsing it", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response("<!doctype html><html><body>shell</body></html>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        }),
+      ),
+    );
+
+    const error = await get("/api/investigation/investigations/INV-1002/recommendation").catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(ApiError);
+    const apiError = error as ApiError;
+    expect(apiError.message).toContain("Expected JSON");
+    expect(apiError.message).toContain("text/html");
+    expect(apiError.url).toContain("INV-1002");
+    // Not a SyntaxError from JSON.parse, which is what this replaces.
+    expect(error).not.toBeInstanceOf(SyntaxError);
+  });
+
+  it("accepts a charset-qualified JSON content type", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json; charset=utf-8" },
+        }),
+      ),
+    );
+
+    await expect(get<{ ok: boolean }>("/x")).resolves.toEqual({ ok: true });
+  });
 });
 
 describe("getOptional", () => {
@@ -101,6 +143,23 @@ describe("getOptional", () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
 
     await expect(getOptional("/recommendation")).rejects.toBeInstanceOf(NetworkError);
+  });
+
+  // "Absent" means the API said 404. An HTML page with a 200 means the request
+  // never reached the API, which is a routing fault and must stay visible —
+  // softening it to null would render "no recommendation" over a broken CDN.
+  it("does not treat a misrouted HTML 200 as an absent resource", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response("<!doctype html>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        }),
+      ),
+    );
+
+    await expect(getOptional("/recommendation")).rejects.toBeInstanceOf(ApiError);
   });
 });
 
